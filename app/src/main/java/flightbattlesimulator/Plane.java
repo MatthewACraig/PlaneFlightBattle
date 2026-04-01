@@ -21,6 +21,12 @@ public class Plane {
         private float roll = 0;     // Rotation around Z-axis (wing tilt)
         private float yaw = 0;      // Rotation around Y-axis (turning left/right)
         private float turnSpeed = 3.0f;
+
+        // Ground collision hitbox (simple vertical half-height)
+        private float collisionHalfHeight = 0.5f;
+
+        // FBX orientation correction (model authored in a different up-axis)
+        private float modelPitchOffset = -90.0f;
         
         // Health system
         private float currentHP = 100.0f;
@@ -65,6 +71,10 @@ public class Plane {
                 System.err.println("Failed to load plane model, using placeholder");
                 this.modelLoader = null;
             } else {
+                // Set hitbox height from model dimensions (supports orientation correction).
+                float modelVerticalSpan = Math.max(this.modelLoader.getScaledHeight(), this.modelLoader.getScaledDepth());
+                this.collisionHalfHeight = Math.max(0.5f, modelVerticalSpan * 0.5f);
+
                 // Print model bounds for debugging
                 this.modelLoader.printModelBounds();
             }
@@ -128,11 +138,17 @@ public class Plane {
             y += velocityY;
             
             // Collision with ground
-            float groundHeight = map.getHeightAt(x, z) + 0.5f;  // +0.5f for plane height
-            if (y < groundHeight) {
-                y = groundHeight;
+            float minAllowedY = map.getHeightAt(x, z) + collisionHalfHeight;
+            if (y < minAllowedY) {
+                y = minAllowedY;
                 velocityY = 0;  // Stop falling
             }
+        }
+
+        public void snapToGround(Map map) {
+            float minAllowedY = map.getHeightAt(x, z) + collisionHalfHeight;
+            y = minAllowedY;
+            velocityY = 0;
         }
 
         public void render() {
@@ -151,6 +167,7 @@ public class Plane {
             
             // Render the 3D model if loaded, otherwise use placeholder
             if (modelLoader != null && modelLoader.isLoaded()) {
+                GL11.glRotatef(modelPitchOffset, 1, 0, 0);
                 modelLoader.render();
             } else {
                 renderPlaceholder();

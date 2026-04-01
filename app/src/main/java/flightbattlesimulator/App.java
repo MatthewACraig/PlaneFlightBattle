@@ -15,8 +15,10 @@ public class App {
     private long window;
     private Plane plane;
     private Map map;
-    private float cameraDistance = 160.0f;
-    private float cameraHeight = 12.0f;
+    private float cameraDistance = 22.0f;
+    private float cameraHeight = 6.0f;
+    private float cameraLookAhead = 8.0f;
+    private float cameraLookDown = 2.0f;
     
     // Camera modes
     private enum CameraMode { THIRD_PERSON, COCKPIT }
@@ -112,13 +114,14 @@ public class App {
             GL11.glLightfv(GL11.GL_LIGHT0, GL11.GL_DIFFUSE, light_diffuse);
         }
         
-        // Initialize game objects
-        plane = new Plane();
-        plane.setPosition(0, -4.5f, 0);  // Place plane directly on ground (ground at -5, plane height 0.5)
-        plane.loadModel("plane/planedone.fbx");  // Load the 3D aircraft model
-        
         map = new Map(200.0f);
         map.setY(-5.0f);
+
+        // Initialize game objects
+        plane = new Plane();
+        plane.setPosition(0, 0, 0);
+        plane.loadModel("plane/planedone.fbx");  // Load the 3D aircraft model
+        plane.snapToGround(map);
         
         return true;
     }
@@ -172,12 +175,43 @@ public class App {
             
             // Set up camera based on current mode
             if (cameraMode == CameraMode.THIRD_PERSON) {
-                // Position camera behind and above the plane (fixed, not orbiting with yaw)
-                float camX = plane.getX();
-                float camY = plane.getY() + cameraHeight;
-                float camZ = plane.getZ() - cameraDistance;
-                
-                lookAt(camX, camY, camZ, plane.getX(), plane.getY(), plane.getZ(), 0, 1, 0);
+                // Chase camera: behind the aircraft based on yaw/pitch, with height offset.
+                float yawRad = (float) Math.toRadians(plane.getYaw());
+                float pitchRad = (float) Math.toRadians(plane.getPitch());
+                float rollRad = (float) Math.toRadians(plane.getRoll());
+
+                // Plane forward vector from yaw/pitch.
+                float forwardX = (float) Math.sin(yawRad);
+                float forwardY = (float) (-Math.cos(yawRad) * Math.sin(pitchRad));
+                float forwardZ = (float) (Math.cos(yawRad) * Math.cos(pitchRad));
+                float forwardLen = (float) Math.sqrt(forwardX * forwardX + forwardY * forwardY + forwardZ * forwardZ);
+                if (forwardLen > 0) {
+                    forwardX /= forwardLen;
+                    forwardY /= forwardLen;
+                    forwardZ /= forwardLen;
+                }
+
+                // Flip chase camera 180 degrees around yaw axis (horizontal heading only).
+                float chaseForwardX = -forwardX;
+                float chaseForwardY = forwardY;
+                float chaseForwardZ = -forwardZ;
+
+                // Up vector from roll so banking/turning is visible in camera orientation.
+                float upX = (float) (-Math.sin(rollRad) * Math.cos(yawRad));
+                float upY = (float) Math.cos(rollRad);
+                float upZ = (float) (Math.sin(rollRad) * Math.sin(yawRad));
+
+                // Camera position: a few units behind, slightly above plane.
+                float camX = plane.getX() - chaseForwardX * cameraDistance;
+                float camY = plane.getY() - chaseForwardY * cameraDistance + cameraHeight;
+                float camZ = plane.getZ() - chaseForwardZ * cameraDistance;
+
+                // Look slightly ahead of the plane to better show climb/dive and turn direction.
+                float targetX = plane.getX() + chaseForwardX * cameraLookAhead;
+                float targetY = plane.getY() + chaseForwardY * cameraLookAhead - cameraLookDown;
+                float targetZ = plane.getZ() + chaseForwardZ * cameraLookAhead;
+
+                lookAt(camX, camY, camZ, targetX, targetY, targetZ, upX, upY, upZ);
             } else {
                 // Cockpit view: camera at plane position, looking forward
                 float camX = plane.getX();

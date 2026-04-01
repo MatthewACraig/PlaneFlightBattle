@@ -11,6 +11,7 @@ import org.lwjgl.system.MemoryUtil;
  * Simple model loader for FBX and other 3D model formats using Assimp
  */
 public class ModelLoader {
+    private static final float TARGET_SIZE = 30.0f;
     private static final int ASSIMP_LOAD_FLAGS = 
         Assimp.aiProcess_Triangulate |
         Assimp.aiProcess_FlipUVs |
@@ -20,6 +21,10 @@ public class ModelLoader {
     private AIScene scene;
     private String loadedPath;
     private float minX, maxX, minY, maxY, minZ, maxZ;
+    private float scaleFactor = 1.0f;
+    private float scaledWidth = 1.0f;
+    private float scaledHeight = 1.0f;
+    private float scaledDepth = 1.0f;
     private boolean boundsCalculated = false;
     
     /**
@@ -119,6 +124,7 @@ public class ModelLoader {
         System.out.println("  X: [" + minX + ", " + maxX + "] (width: " + width + ")");
         System.out.println("  Y: [" + minY + ", " + maxY + "] (height: " + height + ")");
         System.out.println("  Z: [" + minZ + ", " + maxZ + "] (depth: " + depth + ")");
+        System.out.println("  Scaled dimensions -> width: " + scaledWidth + ", height: " + scaledHeight + ", depth: " + scaledDepth);
     }
     
     /**
@@ -151,6 +157,21 @@ public class ModelLoader {
                 }
             }
         }
+
+        float width = maxX - minX;
+        float height = maxY - minY;
+        float depth = maxZ - minZ;
+        float maxDim = Math.max(width, Math.max(height, depth));
+
+        if (maxDim > 0.0001f) {
+            scaleFactor = TARGET_SIZE / maxDim;
+        } else {
+            scaleFactor = 1.0f;
+        }
+
+        scaledWidth = width * scaleFactor;
+        scaledHeight = height * scaleFactor;
+        scaledDepth = depth * scaleFactor;
         
         boundsCalculated = true;
     }
@@ -201,13 +222,7 @@ public class ModelLoader {
             
             // Calculate scaling factors based on model dimensions
             // Target size: longest dimension = 30.0 units (adjusted to match scene scale)
-            float width = maxX - minX;
-            float height = maxY - minY;
-            float depth = maxZ - minZ;
-            
-            float maxDim = Math.max(width, Math.max(height, depth));
-            float targetSize = 30.0f;  // Increased from 1.0f to make plane visible at camera distance
-            float baseScale = targetSize / maxDim;
+            float baseScale = scaleFactor;
             
             // Scale each axis individually to preserve proportions
             float scaleX = baseScale;
@@ -265,5 +280,19 @@ public class ModelLoader {
     
     public String getLoadedPath() {
         return this.loadedPath;
+    }
+
+    public float getScaledHeight() {
+        if (!boundsCalculated) {
+            calculateBounds();
+        }
+        return scaledHeight;
+    }
+
+    public float getScaledDepth() {
+        if (!boundsCalculated) {
+            calculateBounds();
+        }
+        return scaledDepth;
     }
 }

@@ -3,6 +3,7 @@ package flightbattlesimulator;
 import org.lwjgl.*;
 import org.lwjgl.glfw.*;
 import org.lwjgl.opengl.*;
+import org.lwjgl.stb.STBEasyFont;
 import org.lwjgl.system.*;
 
 import java.nio.*;
@@ -23,6 +24,13 @@ public class App {
     // Camera modes
     private enum CameraMode { THIRD_PERSON, COCKPIT }
     private CameraMode cameraMode = CameraMode.THIRD_PERSON;
+
+    // Overlay / diagnostics
+    private boolean showFps = false;
+    private int currentFps = 0;
+    private int fpsFrameCounter = 0;
+    private double fpsTimer = 0.0;
+    private final ByteBuffer fpsVertexBuffer = BufferUtils.createByteBuffer(64 * 1024);
     
     public static void main(String[] args) {
         new App().run();
@@ -75,6 +83,10 @@ public class App {
                 cameraMode = (cameraMode == CameraMode.THIRD_PERSON) ? CameraMode.COCKPIT : CameraMode.THIRD_PERSON;
                 System.out.println("Camera mode: " + cameraMode);
             }
+            if (key == GLFW_KEY_0 && action == GLFW_RELEASE) {
+                showFps = !showFps;
+                System.out.println("FPS overlay: " + (showFps ? "ON" : "OFF"));
+            }
         });
         
         // Make the OpenGL context current
@@ -92,6 +104,13 @@ public class App {
             System.err.println("OpenGL 1.1 is not supported!");
             return false;
         }
+
+        String gpuVendor = glGetString(GL_VENDOR);
+        String gpuRenderer = glGetString(GL_RENDERER);
+        String gpuVersion = glGetString(GL_VERSION);
+        System.out.println("OpenGL Vendor: " + gpuVendor);
+        System.out.println("OpenGL Renderer: " + gpuRenderer);
+        System.out.println("OpenGL Version: " + gpuVersion);
         
         // Setup OpenGL
         glEnable(GL_DEPTH_TEST);
@@ -129,34 +148,81 @@ public class App {
     private void loop() {
         // Set the clear color
         glClearColor(0.6f, 0.8f, 1.0f, 0.0f);  // Light blue sky
+        double lastFrameTime = glfwGetTime();
         
         while (!glfwWindowShouldClose(window)) {
             // Poll events
             glfwPollEvents();
+
+            double currentTime = glfwGetTime();
+            float dt = (float) (currentTime - lastFrameTime);
+            lastFrameTime = currentTime;
+
+            fpsFrameCounter++;
+            fpsTimer += dt;
+            if (fpsTimer >= 1.0) {
+                currentFps = fpsFrameCounter;
+                fpsFrameCounter = 0;
+                fpsTimer = 0.0;
+            }
             
-            // Handle keyboard input for plane control
+            // Handle keyboard input for plane control (axes)
+            float rollInput = 0.0f;
+            float pitchInput = 0.0f;
+            float yawInput = 0.0f;
+
             if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS) {
-                plane.rollLeft();
+                rollInput = 1.0f;
             }
             if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
-                plane.rollRight();
+                rollInput = -1.0f;
             }
             if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS) {
-                plane.pitchUp();
+                pitchInput = 1.0f;
             }
             if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) {
-                plane.pitchDown();
+                pitchInput = -1.0f;
+            }
+
+            // Rudder (yaw)
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+                yawInput = 1.0f;
+            }
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+                yawInput = -1.0f;
+            }
+
+            plane.setRollInput(rollInput);
+            plane.setPitchInput(pitchInput);
+            plane.setYawInput(yawInput);
+
+            // Throttle control
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+                plane.increaseThrottle();
+            }
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+                plane.decreaseThrottle();
             }
             
             // Update
             // plane.accelerate();  // Disabled - plane sits still by default
-            plane.update(map);
+            plane.update(map, dt);
             
             // Clear the framebuffer
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             
             // Set up projection matrix
-            int width = 1200, height = 800;
+            int width;
+            int height;
+            try (MemoryStack stack = stackPush()) {
+                IntBuffer pWidth = stack.mallocInt(1);
+                IntBuffer pHeight = stack.mallocInt(1);
+                glfwGetFramebufferSize(window, pWidth, pHeight);
+                width = pWidth.get(0);
+                height = pHeight.get(0);
+            }
+
+            glViewport(0, 0, width, height);
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();
             float aspect = (float) width / (float) height;
@@ -181,8 +247,8 @@ public class App {
                 float rollRad = (float) Math.toRadians(plane.getRoll());
 
                 // Plane forward vector from yaw/pitch.
-                float forwardX = (float) Math.sin(yawRad);
-                float forwardY = (float) (-Math.cos(yawRad) * Math.sin(pitchRad));
+                float forwardX = (float) (Math.sin(yawRad) * Math.cos(pitchRad));
+                float forwardY = (float) Math.sin(pitchRad);
                 float forwardZ = (float) (Math.cos(yawRad) * Math.cos(pitchRad));
                 float forwardLen = (float) Math.sqrt(forwardX * forwardX + forwardY * forwardY + forwardZ * forwardZ);
                 if (forwardLen > 0) {
@@ -191,7 +257,7 @@ public class App {
                     forwardZ /= forwardLen;
                 }
 
-                // Flip chase camera 180 degrees around yaw axis (horizontal heading only).
+                // Camera alignment tweak: flip horizontal heading so chase view tracks tail/rudder side.
                 float chaseForwardX = -forwardX;
                 float chaseForwardY = forwardY;
                 float chaseForwardZ = -forwardZ;
@@ -222,8 +288,8 @@ public class App {
                 float yawRad = (float) Math.toRadians(plane.getYaw());
                 float pitchRad = (float) Math.toRadians(plane.getPitch());
                 
-                float forwardX = (float) Math.sin(yawRad);
-                float forwardY = (float) (-Math.cos(yawRad) * Math.sin(pitchRad));
+                float forwardX = (float) (Math.sin(yawRad) * Math.cos(pitchRad));
+                float forwardY = (float) Math.sin(pitchRad);
                 float forwardZ = (float) (Math.cos(yawRad) * Math.cos(pitchRad));
                 
                 // Normalize forward direction
@@ -249,6 +315,10 @@ public class App {
             // Render scene
             map.render();
             plane.render();
+
+            if (showFps) {
+                renderFpsOverlay(width, height);
+            }
             
             // Display FPS and plane info
             displayInfo();
@@ -270,10 +340,48 @@ public class App {
     }
     
     private void displayInfo() {
-        // Simple on-screen info (would need text rendering for full implementation)
-        System.out.printf("Plane Position: (%.1f, %.1f, %.1f) | HP: %.1f/%.1f\n",
-            plane.getX(), plane.getY(), plane.getZ(), 
-            plane.getCurrentHP(), plane.getMaxHP());
+        // Keep console output quiet during runtime.
+    }
+
+    private void renderFpsOverlay(int width, int height) {
+        String text = "FPS: " + currentFps;
+        ByteBuffer textBuffer = MemoryUtil.memASCII(text, true);
+
+        fpsVertexBuffer.clear();
+        int numQuads = STBEasyFont.stb_easy_font_print(0.0f, 0.0f, textBuffer, null, fpsVertexBuffer);
+        fpsVertexBuffer.flip();
+        MemoryUtil.memFree(textBuffer);
+
+        float textWidth = text.length() * 8.0f;
+        float x = Math.max(8.0f, width - textWidth - 12.0f);
+        float y = 12.0f;
+
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0.0, width, height, 0.0, -1.0, 1.0);
+
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+        glTranslatef(x, y, 0.0f);
+
+        glDisable(GL_LIGHTING);
+        glDisable(GL_DEPTH_TEST);
+        glColor3f(0.05f, 0.05f, 0.05f);
+
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 16, fpsVertexBuffer);
+        glDrawArrays(GL_QUADS, 0, numQuads * 4);
+        glDisableClientState(GL_VERTEX_ARRAY);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_LIGHTING);
+
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
     }
     
     /**

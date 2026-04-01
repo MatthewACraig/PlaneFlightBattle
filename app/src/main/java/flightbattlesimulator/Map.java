@@ -3,7 +3,7 @@ package flightbattlesimulator;
 import org.lwjgl.opengl.GL11;
 
 public class Map {
-    private float size = 2000.0f;  // Size of the map (2000x2000 square)
+    private float size = 20000.0f;  // Size of the map (2000x2000 square)
     private float y = 0.0f;        // Height of the ground plane
     
     public Map() {

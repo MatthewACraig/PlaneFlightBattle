@@ -1,255 +1,307 @@
 package flightbattlesimulator;
 
-import java.nio.FloatBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import org.lwjgl.opengl.GL11;
-import org.lwjgl.BufferUtils;
 
-public class Plane {
-        // Position
-        private float x = 0, y = 0, z = 0;
-        
-        // Movement
-        private float speed = 0;
-        private float velocityY = 0;  // Vertical velocity for gravity
-        private float maxSpeed = 0.3f;
-        private float acceleration = 0.03f;
-        private float friction = 0.95f;
-        private float gravity = 0.15f;  // Gravity strength
-        
-        // Rotation (Pitch, Roll, Yaw)
-        private float pitch = 0;    // Rotation around X-axis (nose up/down)
-        private float roll = 0;     // Rotation around Z-axis (wing tilt)
-        private float yaw = 0;      // Rotation around Y-axis (turning left/right)
-        private float turnSpeed = 3.0f;
+public class Plane extends RigidBody {
+    private final Engine engine;
+    private final List<WingSurface> wingElements = new ArrayList<>();
 
-        // Ground collision hitbox (simple vertical half-height)
-        private float collisionHalfHeight = 0.5f;
+    // Control inputs (-1..1)
+    private float pitchInput = 0.0f;
+    private float rollInput = 0.0f;
+    private float yawInput = 0.0f;
 
-        // FBX orientation correction (model authored in a different up-axis)
-        private float modelPitchOffset = -90.0f;
-        
-        // Health system
-        private float currentHP = 100.0f;
-        private float maxHP = 100.0f;
-        
-        // Visual
-        private float colorR = 1.0f, colorG = 0.2f, colorB = 0.2f;
-        
-        // 3D Model
-        private ModelLoader modelLoader;
+    // Ground collision hitbox
+    private float collisionHalfHeight = 0.5f;
+    private boolean onGround = true;
 
-        public float getX() { return x; }
-        public float getY() { return y; }
-        public float getZ() { return z; }
-        public float getPitch() { return pitch; }
-        public float getRoll() { return roll; }
-        public float getYaw() { return yaw; }
-        
-        public float getCurrentHP() { return currentHP; }
-        public float getMaxHP() { return maxHP; }
-        public void setMaxHP(float hp) { this.maxHP = hp; this.currentHP = hp; }
-        
-        public void takeDamage(float damage) {
-            currentHP -= damage;
-            if (currentHP < 0) currentHP = 0;
+    // FBX orientation correction
+    private float modelPitchOffset = -90.0f;
+
+    // Stability tuning
+    private float stallSpeed = 8.0f;
+    private float fullControlSpeed = 35.0f;
+
+    // Health system
+    private float currentHP = 100.0f;
+    private float maxHP = 100.0f;
+
+    // Visual
+    private float colorR = 1.0f;
+    private float colorG = 0.2f;
+    private float colorB = 0.2f;
+
+    // 3D Model
+    private ModelLoader modelLoader;
+
+    public Plane() {
+        setMass(1200.0f);
+        setInertia(1800.0f, 2600.0f, 1600.0f);
+
+        engine = new Engine(6500.0f);
+
+        // Main wings
+        wingElements.add(new WingSurface(new Vector3(-4.0f, 0.0f, -1.5f), new Vector3(0.0f, 1.0f, 0.0f), 5.5f, 1.6f, 0.0f, 5.0f, 0.025f));
+        wingElements.add(new WingSurface(new Vector3(4.0f, 0.0f, -1.5f), new Vector3(0.0f, 1.0f, 0.0f), 5.5f, 1.6f, 0.0f, 5.0f, 0.025f));
+
+        // Ailerons
+        wingElements.add(new WingSurface(new Vector3(-5.2f, 0.0f, -0.8f), new Vector3(0.0f, 1.0f, 0.0f), 2.2f, 0.9f, 0.35f, 4.5f, 0.03f));
+        wingElements.add(new WingSurface(new Vector3(5.2f, 0.0f, -0.8f), new Vector3(0.0f, 1.0f, 0.0f), 2.2f, 0.9f, 0.35f, 4.5f, 0.03f));
+
+        // Elevator and rudder
+        wingElements.add(new WingSurface(new Vector3(0.0f, 0.2f, -7.0f), new Vector3(0.0f, 1.0f, 0.0f), 3.0f, 1.2f, 0.4f, 4.2f, 0.035f));
+        wingElements.add(new WingSurface(new Vector3(0.0f, 1.3f, -7.1f), new Vector3(1.0f, 0.0f, 0.0f), 2.2f, 1.0f, 0.35f, 3.0f, 0.04f));
+    }
+
+    public float getThrottle() {
+        return engine.getThrottle();
+    }
+
+    public float getCurrentHP() { return currentHP; }
+    public float getMaxHP() { return maxHP; }
+    public void setMaxHP(float hp) { this.maxHP = hp; this.currentHP = hp; }
+
+    public void takeDamage(float damage) {
+        currentHP -= damage;
+        if (currentHP < 0) currentHP = 0;
+    }
+
+    public void heal(float amount) {
+        currentHP += amount;
+        if (currentHP > maxHP) currentHP = maxHP;
+    }
+
+    public void setColor(float r, float g, float b) {
+        this.colorR = r;
+        this.colorG = g;
+        this.colorB = b;
+    }
+
+    public void loadModel(String modelPath) {
+        this.modelLoader = new ModelLoader();
+        if (!this.modelLoader.loadModel(modelPath)) {
+            System.err.println("Failed to load plane model, using placeholder");
+            this.modelLoader = null;
+        } else {
+            float modelVerticalSpan = Math.max(this.modelLoader.getScaledHeight(), this.modelLoader.getScaledDepth());
+            this.collisionHalfHeight = Math.max(0.5f, modelVerticalSpan * 0.5f);
+            this.modelLoader.printModelBounds();
         }
-        
-        public void heal(float amount) {
-            currentHP += amount;
-            if (currentHP > maxHP) currentHP = maxHP;
-        }
-        
-        public void setColor(float r, float g, float b) {
-            this.colorR = r;
-            this.colorG = g;
-            this.colorB = b;
-        }
-        
-        public void loadModel(String modelPath) {
-            this.modelLoader = new ModelLoader();
-            if (!this.modelLoader.loadModel(modelPath)) {
-                System.err.println("Failed to load plane model, using placeholder");
-                this.modelLoader = null;
-            } else {
-                // Set hitbox height from model dimensions (supports orientation correction).
-                float modelVerticalSpan = Math.max(this.modelLoader.getScaledHeight(), this.modelLoader.getScaledDepth());
-                this.collisionHalfHeight = Math.max(0.5f, modelVerticalSpan * 0.5f);
+    }
 
-                // Print model bounds for debugging
-                this.modelLoader.printModelBounds();
+    public void cleanup() {
+        if (modelLoader != null) {
+            modelLoader.cleanup();
+        }
+    }
+
+    public void increaseThrottle() {
+        engine.increaseThrottle(0.01f);
+    }
+
+    public void decreaseThrottle() {
+        engine.decreaseThrottle(0.01f);
+    }
+
+    public void setPitchInput(float input) {
+        pitchInput = clamp(input, -1.0f, 1.0f);
+    }
+
+    public void setRollInput(float input) {
+        rollInput = clamp(input, -1.0f, 1.0f);
+    }
+
+    public void setYawInput(float input) {
+        yawInput = clamp(input, -1.0f, 1.0f);
+    }
+
+    public void update(Map map) {
+        update(map, 1.0f / 60.0f);
+    }
+
+    public void update(Map map, float dt) {
+        dt = clamp(dt, 1.0f / 240.0f, 1.0f / 20.0f);
+
+        Vector3 bodyVelocity = inverseTransformDirection(velocity);
+        float speed = velocity.length();
+        float forwardSpeed = bodyVelocity.z;
+
+        float authority = controlAuthority(speed);
+        if (onGround && speed < stallSpeed * 1.2f) {
+            authority = 0.0f;
+        }
+
+        // Wing control mapping: [0,1]=main wings, [2,3]=ailerons, [4]=elevator, [5]=rudder
+        wingElements.get(2).setControlInput(rollInput * authority);
+        wingElements.get(3).setControlInput(-rollInput * authority);
+        wingElements.get(4).setControlInput(pitchInput * authority);
+        wingElements.get(5).setControlInput(yawInput * authority);
+
+        engine.applyForce(this);
+        for (WingSurface wing : wingElements) {
+            wing.applyForces(this);
+        }
+
+        // Body torque inputs + angular damping
+        float pitchTorque = 2200.0f * pitchInput * authority;
+        float yawTorque = 1600.0f * yawInput * authority;
+        float rollTorque = 2800.0f * rollInput * authority;
+
+        addRelativeTorque(new Vector3(
+            pitchTorque - angularVelocity.x * 350.0f,
+            yawTorque - angularVelocity.y * 220.0f,
+            rollTorque - angularVelocity.z * 320.0f
+        ));
+
+        integrate(dt);
+
+        // Ground collision/resting behavior
+        float minAllowedY = map.getHeightAt(position.x, position.z) + collisionHalfHeight;
+        if (position.y < minAllowedY) {
+            position.y = minAllowedY;
+            if (velocity.y < 0.0f) {
+                velocity.y = 0.0f;
+            }
+            onGround = true;
+        } else {
+            onGround = false;
+        }
+
+        if (onGround) {
+            float friction = (float) Math.pow(0.992f, dt * 60.0f);
+            velocity.x *= friction;
+            velocity.z *= friction;
+
+            float angularFriction = (float) Math.pow(0.85f, dt * 60.0f);
+            angularVelocity.x *= angularFriction;
+            angularVelocity.z *= angularFriction;
+
+            if (speed < 1.0f && engine.getThrottle() < 0.02f) {
+                velocity.x = 0.0f;
+                velocity.z = 0.0f;
+                angularVelocity.x = 0.0f;
+                angularVelocity.y = 0.0f;
+                angularVelocity.z = 0.0f;
+
+                orientation.x *= 0.9f;
+                orientation.z *= 0.9f;
+            }
+
+            if (forwardSpeed < 0.5f && engine.getThrottle() < 0.05f) {
+                // Prevent backward rolling at idle.
+                velocity.x *= 0.95f;
+                velocity.z *= 0.95f;
             }
         }
-        
-        public void setPosition(float x, float y, float z) {
-            this.x = x;
-            this.y = y;
-            this.z = z;
+    }
+
+    public void snapToGround(Map map) {
+        float minAllowedY = map.getHeightAt(position.x, position.z) + collisionHalfHeight;
+        position.y = minAllowedY;
+        velocity.set(0.0f, 0.0f, 0.0f);
+        angularVelocity.set(0.0f, 0.0f, 0.0f);
+        onGround = true;
+    }
+
+    public void render() {
+        GL11.glPushMatrix();
+
+        GL11.glTranslatef(position.x, position.y, position.z);
+        GL11.glRotatef(orientation.y, 0, 1, 0);  // Yaw
+        GL11.glRotatef(orientation.x, 1, 0, 0);  // Pitch
+        GL11.glRotatef(orientation.z, 0, 0, 1);  // Roll
+
+        GL11.glColor3f(colorR, colorG, colorB);
+
+        if (modelLoader != null && modelLoader.isLoaded()) {
+            GL11.glRotatef(modelPitchOffset, 1, 0, 0);
+            modelLoader.render();
+        } else {
+            renderPlaceholder();
         }
 
-        public void cleanup() {
-            // Clean up model resources
-            if (modelLoader != null) {
-                modelLoader.cleanup();
-            }
-        }
+        GL11.glPopMatrix();
+    }
 
-        public void accelerate() {
-            if (speed < maxSpeed) speed += acceleration;
+    private float controlAuthority(float airspeed) {
+        if (airspeed <= stallSpeed) {
+            return 0.0f;
         }
+        float value = (airspeed - stallSpeed) / (fullControlSpeed - stallSpeed);
+        return clamp(value, 0.0f, 1.0f);
+    }
 
-        public void decelerate() {
-            if (speed > -maxSpeed) speed -= acceleration;
-        }
+    private void renderPlaceholder() {
+        GL11.glBegin(GL11.GL_TRIANGLES);
 
-        public void turnLeft() {
-            yaw += turnSpeed;
-        }
+        GL11.glColor3f(colorR, colorG, colorB);
+        float fuseLength = 2.0f;
+        float fuseRadius = 0.2f;
 
-        public void turnRight() {
-            yaw -= turnSpeed;
-        }
-        
-        public void pitchUp() {
-            pitch += turnSpeed;
-        }
-        
-        public void pitchDown() {
-            pitch -= turnSpeed;
-        }
-        
-        public void rollLeft() {
-            roll += turnSpeed;
-        }
-        
-        public void rollRight() {
-            roll -= turnSpeed;
-        }
+        GL11.glColor3f(colorR + 0.2f, colorG, colorB);
+        GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
+        GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
+        GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
 
-        public void update(Map map) {
-            // Update position based on speed and yaw
-            x += speed * Math.sin(Math.toRadians(yaw));
-            z += speed * Math.cos(Math.toRadians(yaw));
-            
-            // Apply friction to speed
-            speed *= friction;
-            
-            // Apply gravity
-            velocityY -= gravity;
-            y += velocityY;
-            
-            // Collision with ground
-            float minAllowedY = map.getHeightAt(x, z) + collisionHalfHeight;
-            if (y < minAllowedY) {
-                y = minAllowedY;
-                velocityY = 0;  // Stop falling
-            }
-        }
+        GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
+        GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
+        GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
 
-        public void snapToGround(Map map) {
-            float minAllowedY = map.getHeightAt(x, z) + collisionHalfHeight;
-            y = minAllowedY;
-            velocityY = 0;
-        }
+        GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
+        GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
+        GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
 
-        public void render() {
-            GL11.glPushMatrix();
-            
-            // Translate to position
-            GL11.glTranslatef(x, y, z);
-            
-            // Apply rotations (Yaw -> Pitch -> Roll order)
-            GL11.glRotatef(yaw, 0, 1, 0);      // Yaw around Y-axis
-            GL11.glRotatef(pitch, 1, 0, 0);    // Pitch around X-axis
-            GL11.glRotatef(roll, 0, 0, 1);     // Roll around Z-axis
-            
-            // Set color
-            GL11.glColor3f(colorR, colorG, colorB);
-            
-            // Render the 3D model if loaded, otherwise use placeholder
-            if (modelLoader != null && modelLoader.isLoaded()) {
-                GL11.glRotatef(modelPitchOffset, 1, 0, 0);
-                modelLoader.render();
-            } else {
-                renderPlaceholder();
-            }
-            
-            GL11.glPopMatrix();
-        }
-        
-        private void renderPlaceholder() {
-            // Aircraft-like placeholder with fuselage and wings
-            GL11.glBegin(GL11.GL_TRIANGLES);
-            
-            // Fuselage (cylindrical body) - render as cone-like shape
-            GL11.glColor3f(colorR, colorG, colorB);
-            float fuseLength = 2.0f;
-            float fuseRadius = 0.2f;
-            
-            // Nose cone
-            GL11.glColor3f(colorR + 0.2f, colorG, colorB);
-            GL11.glVertex3f(0, fuseRadius, fuseLength / 2);  // Nose tip (pointing forward in Z)
-            GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
-            GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
-            GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
-            GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
-            GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
-            GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
-            GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
-            GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
-            
-            // Tail
-            GL11.glColor3f(colorR, colorG + 0.1f, colorB);
-            GL11.glVertex3f(0, 0, -fuseLength / 2);
-            GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
-            GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, 0, -fuseLength / 2);
-            GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
-            GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, 0, -fuseLength / 2);
-            GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
-            GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
-            
-            GL11.glVertex3f(0, 0, -fuseLength / 2);
-            GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
-            GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
-            
-            GL11.glEnd();
-            
-            // Wings (flat rectangles) - MUCH WIDER NOW
-            GL11.glColor3f(colorR - 0.2f, colorG, colorB);
-            GL11.glBegin(GL11.GL_QUADS);
-            float wingSpan = 4.0f;    // Doubled from 2.0f
-            float wingChord = 1.0f;   // Doubled from 0.5f
-            
-            // Right wing
-            GL11.glNormal3f(0, 1, 0);
-            GL11.glVertex3f(0, 0, -fuseLength / 4);
-            GL11.glVertex3f(wingSpan / 2, 0, -fuseLength / 4);
-            GL11.glVertex3f(wingSpan / 2, 0, -fuseLength / 4 + wingChord);
-            GL11.glVertex3f(0, 0, -fuseLength / 4 + wingChord);
-            
-            // Left wing
-            GL11.glVertex3f(0, 0, -fuseLength / 4);
-            GL11.glVertex3f(-wingSpan / 2, 0, -fuseLength / 4);
-            GL11.glVertex3f(-wingSpan / 2, 0, -fuseLength / 4 + wingChord);
-            GL11.glVertex3f(0, 0, -fuseLength / 4 + wingChord);
-            
-            // Tail wing (vertical stabilizer)
-            GL11.glNormal3f(1, 0, 0);
-            GL11.glVertex3f(0, 0, -fuseLength / 2);
-            GL11.glVertex3f(0, 0.6f, -fuseLength / 2);
-            GL11.glVertex3f(0, 0.6f, -fuseLength / 2 + 0.6f);
-            GL11.glVertex3f(0, 0, -fuseLength / 2 + 0.6f);
-            
-            GL11.glEnd();
-        }
+        GL11.glVertex3f(0, fuseRadius, fuseLength / 2);
+        GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
+        GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
+
+        GL11.glColor3f(colorR, colorG + 0.1f, colorB);
+        GL11.glVertex3f(0, 0, -fuseLength / 2);
+        GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
+        GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
+
+        GL11.glVertex3f(0, 0, -fuseLength / 2);
+        GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
+        GL11.glVertex3f(0, -fuseRadius, -fuseLength / 4);
+
+        GL11.glVertex3f(0, 0, -fuseLength / 2);
+        GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
+        GL11.glVertex3f(-fuseRadius, 0, -fuseLength / 4);
+
+        GL11.glVertex3f(0, 0, -fuseLength / 2);
+        GL11.glVertex3f(fuseRadius, 0, -fuseLength / 4);
+        GL11.glVertex3f(0, fuseRadius, -fuseLength / 4);
+
+        GL11.glEnd();
+
+        GL11.glColor3f(colorR - 0.2f, colorG, colorB);
+        GL11.glBegin(GL11.GL_QUADS);
+        float wingSpan = 4.0f;
+        float wingChord = 1.0f;
+
+        GL11.glNormal3f(0, 1, 0);
+        GL11.glVertex3f(0, 0, -fuseLength / 4);
+        GL11.glVertex3f(wingSpan / 2, 0, -fuseLength / 4);
+        GL11.glVertex3f(wingSpan / 2, 0, -fuseLength / 4 + wingChord);
+        GL11.glVertex3f(0, 0, -fuseLength / 4 + wingChord);
+
+        GL11.glVertex3f(0, 0, -fuseLength / 4);
+        GL11.glVertex3f(-wingSpan / 2, 0, -fuseLength / 4);
+        GL11.glVertex3f(-wingSpan / 2, 0, -fuseLength / 4 + wingChord);
+        GL11.glVertex3f(0, 0, -fuseLength / 4 + wingChord);
+
+        GL11.glNormal3f(1, 0, 0);
+        GL11.glVertex3f(0, 0, -fuseLength / 2);
+        GL11.glVertex3f(0, 0.6f, -fuseLength / 2);
+        GL11.glVertex3f(0, 0.6f, -fuseLength / 2 + 0.6f);
+        GL11.glVertex3f(0, 0, -fuseLength / 2 + 0.6f);
+
+        GL11.glEnd();
+    }
+
+    private float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
 }
-

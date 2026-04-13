@@ -53,19 +53,23 @@ public class App {
     private ModelLoader planeModel;
     private ModelLoader targetModel;
     private AudioEngine audioEngine;
-    private int planeRumbleSource = -1;
-    private int freeBirdSource = -1;
+    private int plane1RumbleSource = -1;
+    private int plane2RumbleSource = -1;
+    private int plane1FreeBirdSource = -1;
+    private int plane2FreeBirdSource = -1;
     private int targetGrabbedSource = -1;
     private int turretShootSource = -1;
     private static final float PLANE_RUMBLE_BASE_GAIN = 0.18f;
     private static final float FREE_BIRD_BASE_GAIN = 0.36f;
     private static final float PILOT_RUMBLE_GAIN = 0.34f;
+    private static final float BASE_PLANE_SPEED = 80.64f;
+    private static final float BOOST_MULTIPLIER = 1.5f;
+    private static final float BOOST_DRAIN_PER_SECOND = 1.0f / 2.0f;
+    private static final float BOOST_REGEN_PER_SECOND = 1.0f / 20.0f;
     private final float planeModelPitchOffset = -90.0f;
     private final float planeModelRollOffset = 180.0f;
     private final float targetModelPitchOffset = -90.0f;
     private final float targetModelScale = 0.14f;
-    private final List<Vector3> turretPositions = new ArrayList<>();
-    private int currentTurretPositionIndex = 0;
     private final Random random = new Random();
 
     private ScreenState screenState = ScreenState.MENU;
@@ -75,10 +79,11 @@ public class App {
     private final ByteBuffer textVertexBuffer = BufferUtils.createByteBuffer(64 * 1024);
     private final GameState gameState = new GameState();
 
-    private String statusText = "Press H to Host (Pilot) or J to Join (Turret)";
+    private String statusText = "Press H to Host (Plane 1) or J to Join (Plane 2)";
     private String gameOverText = "";
     private float countdownTimer = 3.0f;
     private ScreenState pausedReturnState = ScreenState.PLAYING;
+    private boolean musicMuted = false;
 
     private boolean cursorCaptured = false;
     private boolean firstMouseSample = true;
@@ -93,14 +98,9 @@ public class App {
 
     private final List<BulletTrace> bulletTraces = new ArrayList<>();
 
-    // Turret state sent from client to host
-    private float remoteTurretYaw = 180.0f;
-    private float remoteTurretPitch = -5.0f;
-    private boolean remoteTurretFired = false;
-
-    // Local turret camera state when playing as client
-    private float localTurretYaw = 180.0f;
-    private float localTurretPitch = -5.0f;
+    private float plane2Bank = 0.0f;
+    private float planeBoostEnergy = 1.0f;
+    private boolean planeBoostLockedOut = false;
 
     private int currentFps = 0;
     private int fpsFrameCounter = 0;
@@ -170,8 +170,6 @@ public class App {
         map = new Map(1400.0f);
         map.setY(-2.5f);
 
-        initTurretPositions();
-
         planeModel = new ModelLoader();
         if (!planeModel.loadModel("plane/planedone.fbx")) {
             System.err.println("Failed to load plane/planedone.fbx, falling back to simple plane mesh.");
@@ -198,7 +196,7 @@ public class App {
             return;
         }
 
-        planeRumbleSource = audioEngine.createMp3Source(
+        plane1RumbleSource = audioEngine.createMp3Source(
             "sounds/plane_rumble.mp3",
             true,
             PLANE_RUMBLE_BASE_GAIN,
@@ -207,7 +205,25 @@ public class App {
             900.0f,
             1.15f
         );
-        freeBirdSource = audioEngine.createMp3Source(
+        plane2RumbleSource = audioEngine.createMp3Source(
+            "sounds/plane_rumble.mp3",
+            true,
+            PLANE_RUMBLE_BASE_GAIN,
+            1.0f,
+            32.0f,
+            900.0f,
+            1.15f
+        );
+        plane1FreeBirdSource = audioEngine.createMp3Source(
+            "sounds/Free Bird.mp3",
+            true,
+            FREE_BIRD_BASE_GAIN,
+            1.0f,
+            55.0f,
+            1700.0f,
+            0.45f
+        );
+        plane2FreeBirdSource = audioEngine.createMp3Source(
             "sounds/Free Bird.mp3",
             true,
             FREE_BIRD_BASE_GAIN,
@@ -318,20 +334,16 @@ public class App {
         if (screenState == ScreenState.PLAYING) {
             if (localRole == Role.PILOT) {
                 updatePilotGameplay(dt);
-                if (remoteTurretFired) {
-                    handleTurretShot(remoteTurretYaw, remoteTurretPitch);
-                    remoteTurretFired = false;
-                }
 
                 if (gameState.planeHp <= 0.0f) {
-                    endGame("Turret Wins! Plane destroyed.", "TURRET");
+                    endGame("Plane 2 Wins! Plane 1 destroyed.", "PLANE2");
                 } else if (gameState.destroyedTargetCount() == gameState.targets.size()) {
-                    endGame("Pilot Wins! All targets destroyed.", "PILOT");
+                    endGame("Plane 1 Wins! All targets destroyed.", "PLANE1");
                 }
 
                 sendSnapshotToClient();
             } else if (localRole == Role.TURRET) {
-                updateTurretControls(dt);
+                updatePlane2Gameplay(dt);
             }
         }
     }
@@ -349,11 +361,27 @@ public class App {
         planeBank += (targetBank - planeBank) * bankLerp;
         gameState.planeRoll = planeBank;
 
+        if (planeBoostLockedOut && planeBoostEnergy >= 1.0f) {
+            planeBoostLockedOut = false;
+        }
+
+        boolean boostHeld = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+        boolean boosting = boostHeld && !planeBoostLockedOut && planeBoostEnergy > 0.0f;
+        if (boosting) {
+            planeBoostEnergy = Math.max(0.0f, planeBoostEnergy - BOOST_DRAIN_PER_SECOND * dt);
+            if (planeBoostEnergy <= 0.0f) {
+                planeBoostLockedOut = true;
+            }
+        } else {
+            planeBoostEnergy = Math.min(1.0f, planeBoostEnergy + BOOST_REGEN_PER_SECOND * dt);
+        }
+
         Vector3 forward = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
-        gameState.planePosition.add(forward.mul(gameState.planeSpeed * dt));
+        float speedMultiplier = boosting ? BOOST_MULTIPLIER : 1.0f;
+        gameState.planePosition.add(forward.mul(gameState.planeSpeed * speedMultiplier * dt));
 
         float terrainFloor = map != null ? map.getHeightAt(gameState.planePosition.x, gameState.planePosition.z) : 0.0f;
-        float minAltitude = Math.max(-78.0f, terrainFloor);
+        float minAltitude = Math.max(-86.0f, terrainFloor);
         gameState.planePosition.y = clamp(gameState.planePosition.y, minAltitude, 120.0f);
         gameState.planePosition.x = clamp(gameState.planePosition.x, -620.0f, 620.0f);
         gameState.planePosition.z = clamp(gameState.planePosition.z, -620.0f, 620.0f);
@@ -362,16 +390,38 @@ public class App {
         updateTargetEvasion(dt);
     }
 
-    private void updateTurretControls(float dt) {
+    private void updatePlane2Gameplay(float dt) {
         Vector2 mouseDelta = sampleMouseDelta();
-        float sensitivity = 0.12f;
+        float sensitivity = 0.1f;
 
-        localTurretYaw -= mouseDelta.x * sensitivity;
-        localTurretPitch -= mouseDelta.y * sensitivity;
-        localTurretPitch = clamp(localTurretPitch, -70.0f, 35.0f);
+        gameState.plane2Yaw -= mouseDelta.x * sensitivity;
+        gameState.plane2Pitch -= mouseDelta.y * sensitivity;
+        gameState.plane2Pitch = clamp(gameState.plane2Pitch, -35.0f, 35.0f);
+
+        float targetBank = clamp(mouseDelta.x * 1.25f, -32.0f, 32.0f);
+        float bankLerp = clamp(dt * 8.5f, 0.0f, 1.0f);
+        plane2Bank += (targetBank - plane2Bank) * bankLerp;
+        gameState.plane2Roll = plane2Bank;
+
+        Vector3 forward = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
+        gameState.plane2Position.add(forward.mul(gameState.plane2Speed * dt));
+
+        float terrainFloor = map != null ? map.getHeightAt(gameState.plane2Position.x, gameState.plane2Position.z) : 0.0f;
+        float minAltitude = Math.max(-86.0f, terrainFloor);
+        gameState.plane2Position.y = clamp(gameState.plane2Position.y, minAltitude, 120.0f);
+        gameState.plane2Position.x = clamp(gameState.plane2Position.x, -620.0f, 620.0f);
+        gameState.plane2Position.z = clamp(gameState.plane2Position.z, -620.0f, 620.0f);
 
         if (networkPeer != null && networkPeer.isConnected()) {
-            networkPeer.send("AIM|" + localTurretYaw + "|" + localTurretPitch);
+            networkPeer.send(
+                "P2STATE|"
+                    + gameState.plane2Position.x + "|"
+                    + gameState.plane2Position.y + "|"
+                    + gameState.plane2Position.z + "|"
+                    + gameState.plane2Yaw + "|"
+                    + gameState.plane2Pitch + "|"
+                    + gameState.plane2Roll
+            );
         }
 
         boolean leftPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
@@ -380,53 +430,30 @@ public class App {
 
         if (justPressed && localFireCooldown <= 0.0f) {
             localFireCooldown = 0.15f;
-            Vector3 turretDir = directionFromYawPitch(localTurretYaw, localTurretPitch);
-            Vector3 start = gameState.turretPosition.copy().add(turretDir.copy().mul(3.5f));
+            Vector3 shotDir = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
+            Vector3 start = gameState.plane2Position.copy().add(shotDir.copy().mul(6.0f));
             addBulletTrace(
                 start,
-                start.copy().add(turretDir.mul(700.0f)),
+                start.copy().add(shotDir.mul(700.0f)),
                 1.0f,
                 0.9f,
                 0.1f
             );
             if (audioEngine != null) {
-                audioEngine.setSourcePosition(turretShootSource, gameState.turretPosition);
+                audioEngine.setSourcePosition(turretShootSource, gameState.plane2Position);
                 audioEngine.playOneShot(turretShootSource);
             }
             if (networkPeer != null && networkPeer.isConnected()) {
-                networkPeer.send("FIRE_TURRET");
+                networkPeer.send(
+                    "FIRE_P2|"
+                        + start.x + "|"
+                        + start.y + "|"
+                        + start.z + "|"
+                        + shotDir.x + "|"
+                        + shotDir.y + "|"
+                        + shotDir.z
+                );
             }
-        }
-    }
-
-    private void initTurretPositions() {
-        turretPositions.clear();
-        turretPositions.add(new Vector3(0.0f, 5.0f, 0.0f));
-        turretPositions.add(new Vector3(220.0f, 5.0f, 180.0f));
-        turretPositions.add(new Vector3(-240.0f, 5.0f, 160.0f));
-        turretPositions.add(new Vector3(260.0f, 5.0f, -220.0f));
-        turretPositions.add(new Vector3(-260.0f, 5.0f, -210.0f));
-        turretPositions.add(new Vector3(40.0f, 5.0f, -320.0f));
-    }
-
-    private void setTurretPositionIndex(int index) {
-        if (turretPositions.isEmpty()) {
-            return;
-        }
-
-        int wrapped = index % turretPositions.size();
-        if (wrapped < 0) {
-            wrapped += turretPositions.size();
-        }
-
-        currentTurretPositionIndex = wrapped;
-        gameState.turretPosition.set(turretPositions.get(currentTurretPositionIndex));
-    }
-
-    private void cycleTurretPosition() {
-        setTurretPositionIndex(currentTurretPositionIndex + 1);
-        if (networkPeer != null && networkPeer.isConnected()) {
-            networkPeer.send("TURRET_POS|" + currentTurretPositionIndex);
         }
     }
 
@@ -490,9 +517,18 @@ public class App {
             Vector3 offset = gameState.targets.get(i).copy().sub(gameState.planePosition);
             if (offset.lengthSquared() <= captureRadiusSq) {
                 gameState.destroyedTargets[i] = true;
+                Vector3 collectedPos = gameState.targets.get(i);
                 if (audioEngine != null) {
-                    audioEngine.setSourcePosition(targetGrabbedSource, gameState.targets.get(i));
+                    audioEngine.setSourcePosition(targetGrabbedSource, collectedPos);
                     audioEngine.playOneShot(targetGrabbedSource);
+                }
+                if (localRole == Role.PILOT && networkPeer != null && networkPeer.isConnected()) {
+                    networkPeer.send(
+                        "TARGET_COLLECT|"
+                            + collectedPos.x + "|"
+                            + collectedPos.y + "|"
+                            + collectedPos.z
+                    );
                 }
             }
         }
@@ -549,16 +585,14 @@ public class App {
         }
     }
 
-    private void handleTurretShot(float yaw, float pitch) {
-        Vector3 turretOrigin = gameState.turretPosition.copy();
-        Vector3 dir = directionFromYawPitch(yaw, pitch);
-        Vector3 start = turretOrigin.copy().add(dir.copy().mul(3.5f));
+    private void handlePlane2Shot(Vector3 shotOrigin, Vector3 dir) {
+        Vector3 start = shotOrigin.copy();
         addBulletTrace(start, start.copy().add(dir.copy().mul(700.0f)), 1.0f, 0.9f, 0.1f);
         if (audioEngine != null) {
-            audioEngine.setSourcePosition(turretShootSource, turretOrigin);
+            audioEngine.setSourcePosition(turretShootSource, shotOrigin);
             audioEngine.playOneShot(turretShootSource);
         }
-        if (raySphereHit(turretOrigin, dir, gameState.planePosition, 5.5f)) {
+        if (raySphereHit(shotOrigin, dir, gameState.planePosition, 5.5f)) {
             gameState.planeHp -= 1.0f;
             gameState.planeHp = Math.max(0.0f, gameState.planeHp);
         }
@@ -577,10 +611,13 @@ public class App {
             .append(gameState.planePitch).append('|')
             .append(gameState.planeRoll).append('|')
             .append(gameState.planeHp).append('|')
-            .append(targetMask()).append('|')
-            .append(gameState.turretPosition.x).append('|')
-            .append(gameState.turretPosition.y).append('|')
-            .append(gameState.turretPosition.z);
+            .append(gameState.plane2Position.x).append('|')
+            .append(gameState.plane2Position.y).append('|')
+            .append(gameState.plane2Position.z).append('|')
+            .append(gameState.plane2Yaw).append('|')
+            .append(gameState.plane2Pitch).append('|')
+            .append(gameState.plane2Roll).append('|')
+            .append(targetMask());
 
         for (int i = 0; i < gameState.targets.size(); i++) {
             Vector3 target = gameState.targets.get(i);
@@ -651,13 +688,27 @@ public class App {
             }
 
             if (localRole == Role.PILOT) {
-                if ("AIM".equals(parts[0]) && parts.length >= 3) {
-                    remoteTurretYaw = parseFloatSafe(parts[1], remoteTurretYaw);
-                    remoteTurretPitch = parseFloatSafe(parts[2], remoteTurretPitch);
-                } else if ("FIRE_TURRET".equals(parts[0])) {
-                    remoteTurretFired = true;
-                } else if ("TURRET_POS".equals(parts[0]) && parts.length >= 2) {
-                    setTurretPositionIndex((int) parseFloatSafe(parts[1], currentTurretPositionIndex));
+                if ("P2STATE".equals(parts[0]) && parts.length >= 7) {
+                    gameState.plane2Position.set(
+                        parseFloatSafe(parts[1], gameState.plane2Position.x),
+                        parseFloatSafe(parts[2], gameState.plane2Position.y),
+                        parseFloatSafe(parts[3], gameState.plane2Position.z)
+                    );
+                    gameState.plane2Yaw = parseFloatSafe(parts[4], gameState.plane2Yaw);
+                    gameState.plane2Pitch = parseFloatSafe(parts[5], gameState.plane2Pitch);
+                    gameState.plane2Roll = parseFloatSafe(parts[6], gameState.plane2Roll);
+                } else if ("FIRE_P2".equals(parts[0]) && parts.length >= 7) {
+                    Vector3 origin = new Vector3(
+                        parseFloatSafe(parts[1], gameState.plane2Position.x),
+                        parseFloatSafe(parts[2], gameState.plane2Position.y),
+                        parseFloatSafe(parts[3], gameState.plane2Position.z)
+                    );
+                    Vector3 dir = new Vector3(
+                        parseFloatSafe(parts[4], 0.0f),
+                        parseFloatSafe(parts[5], 0.0f),
+                        parseFloatSafe(parts[6], 1.0f)
+                    ).normalize();
+                    handlePlane2Shot(origin, dir);
                 }
             } else if (localRole == Role.TURRET) {
                 if ("COUNTDOWN".equals(parts[0]) && parts.length >= 2) {
@@ -665,12 +716,7 @@ public class App {
                     screenState = ScreenState.COUNTDOWN;
                 } else if ("START".equals(parts[0])) {
                     screenState = ScreenState.PLAYING;
-                } else if ("SNAP".equals(parts[0]) && parts.length >= 8) {
-                    boolean hasPlaneRoll = parts.length >= 12;
-                    int hpIndex = hasPlaneRoll ? 7 : 6;
-                    int maskIndex = hasPlaneRoll ? 8 : 7;
-                    int turretIndex = hasPlaneRoll ? 9 : 8;
-
+                } else if ("SNAP".equals(parts[0]) && parts.length >= 15) {
                     gameState.planePosition.set(
                         parseFloatSafe(parts[1], gameState.planePosition.x),
                         parseFloatSafe(parts[2], gameState.planePosition.y),
@@ -678,26 +724,21 @@ public class App {
                     );
                     gameState.planeYaw = parseFloatSafe(parts[4], gameState.planeYaw);
                     gameState.planePitch = parseFloatSafe(parts[5], gameState.planePitch);
-                    if (hasPlaneRoll) {
-                        gameState.planeRoll = parseFloatSafe(parts[6], gameState.planeRoll);
-                    }
-                    gameState.planeHp = parseFloatSafe(parts[hpIndex], gameState.planeHp);
-                    applyTargetMask((int) parseFloatSafe(parts[maskIndex], targetMask()));
+                    gameState.planeRoll = parseFloatSafe(parts[6], gameState.planeRoll);
+                    gameState.planeHp = parseFloatSafe(parts[7], gameState.planeHp);
+                    gameState.plane2Position.set(
+                        parseFloatSafe(parts[8], gameState.plane2Position.x),
+                        parseFloatSafe(parts[9], gameState.plane2Position.y),
+                        parseFloatSafe(parts[10], gameState.plane2Position.z)
+                    );
+                    gameState.plane2Yaw = parseFloatSafe(parts[11], gameState.plane2Yaw);
+                    gameState.plane2Pitch = parseFloatSafe(parts[12], gameState.plane2Pitch);
+                    gameState.plane2Roll = parseFloatSafe(parts[13], gameState.plane2Roll);
+                    applyTargetMask((int) parseFloatSafe(parts[14], targetMask()));
 
-                    int expectedWithTurretPos = turretIndex + 3 + gameState.targets.size() * 3;
-                    int expectedWithoutTurretPos = turretIndex + gameState.targets.size() * 3;
-                    int partIndex = turretIndex;
-
-                    if (parts.length >= expectedWithTurretPos) {
-                        gameState.turretPosition.set(
-                            parseFloatSafe(parts[turretIndex], gameState.turretPosition.x),
-                            parseFloatSafe(parts[turretIndex + 1], gameState.turretPosition.y),
-                            parseFloatSafe(parts[turretIndex + 2], gameState.turretPosition.z)
-                        );
-                        partIndex = turretIndex + 3;
-                    }
-
-                    if (parts.length >= expectedWithoutTurretPos) {
+                    int partIndex = 15;
+                    int expectedCount = partIndex + gameState.targets.size() * 3;
+                    if (parts.length >= expectedCount) {
                         for (int i = 0; i < gameState.targets.size(); i++) {
                             Vector3 target = gameState.targets.get(i);
                             target.set(
@@ -707,21 +748,22 @@ public class App {
                             );
                             partIndex += 3;
                         }
-                    } else if (parts.length >= 11) {
-                        int lastTargetIndex = findLastRemainingTargetIndex();
-                        if (lastTargetIndex >= 0) {
-                            gameState.targets.get(lastTargetIndex).set(
-                                parseFloatSafe(parts[8], gameState.targets.get(lastTargetIndex).x),
-                                parseFloatSafe(parts[9], gameState.targets.get(lastTargetIndex).y),
-                                parseFloatSafe(parts[10], gameState.targets.get(lastTargetIndex).z)
-                            );
-                        }
                     }
                 } else if ("END".equals(parts[0]) && parts.length >= 2) {
                     screenState = ScreenState.GAME_OVER;
-                    gameOverText = "PILOT".equals(parts[1])
-                        ? "Pilot Wins! All targets destroyed."
-                        : "Turret Wins! Plane destroyed.";
+                    gameOverText = "PLANE1".equals(parts[1])
+                        ? "Plane 1 Wins! All targets destroyed."
+                        : "Plane 2 Wins! Plane 1 destroyed.";
+                } else if ("TARGET_COLLECT".equals(parts[0]) && parts.length >= 4) {
+                    if (audioEngine != null) {
+                        Vector3 collectedPos = new Vector3(
+                            parseFloatSafe(parts[1], gameState.planePosition.x),
+                            parseFloatSafe(parts[2], gameState.planePosition.y),
+                            parseFloatSafe(parts[3], gameState.planePosition.z)
+                        );
+                        audioEngine.setSourcePosition(targetGrabbedSource, collectedPos);
+                        audioEngine.playOneShot(targetGrabbedSource);
+                    }
                 }
             }
         }
@@ -735,8 +777,8 @@ public class App {
         updateAudioScene();
 
         map.render();
-        renderTurret();
         renderPlane();
+        renderPlane2();
         renderTargets();
         renderBulletTraces();
 
@@ -760,14 +802,12 @@ public class App {
             Vector3 lookTarget = gameState.planePosition.copy().add(forward.copy().mul(15.0f));
             setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
         } else {
-            float yaw = (screenState == ScreenState.PLAYING) ? localTurretYaw : 180.0f;
-            float pitch = (screenState == ScreenState.PLAYING) ? localTurretPitch : -5.0f;
+            Vector3 forward = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
+            Vector3 cameraPos = gameState.plane2Position.copy().sub(forward.copy().mul(18.0f));
+            cameraPos.y += 6.0f;
 
-            Vector3 origin = gameState.turretPosition;
-            Vector3 dir = directionFromYawPitch(yaw, pitch);
-            Vector3 target = origin.copy().add(dir.mul(100.0f));
-
-            setCameraAndListener(origin.x, origin.y, origin.z, target.x, target.y, target.z, 0.0f, 1.0f, 0.0f);
+            Vector3 lookTarget = gameState.plane2Position.copy().add(forward.copy().mul(15.0f));
+            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
         }
     }
 
@@ -797,35 +837,36 @@ public class App {
             return;
         }
 
-        audioEngine.setSourcePosition(planeRumbleSource, gameState.planePosition);
-        audioEngine.setSourcePosition(freeBirdSource, gameState.planePosition);
+        audioEngine.setSourcePosition(plane1RumbleSource, gameState.planePosition);
+        audioEngine.setSourcePosition(plane2RumbleSource, gameState.plane2Position);
+        audioEngine.setSourcePosition(plane1FreeBirdSource, gameState.planePosition);
+        audioEngine.setSourcePosition(plane2FreeBirdSource, gameState.plane2Position);
 
-        float rumbleGain = PLANE_RUMBLE_BASE_GAIN;
-        float musicGain = FREE_BIRD_BASE_GAIN;
-        if (localRole == Role.PILOT) {
-            rumbleGain = PILOT_RUMBLE_GAIN;
-            musicGain = 0.0f;
-        } else if (localRole == Role.TURRET) {
-            float distance = gameState.planePosition.copy().sub(gameState.turretPosition).length();
-            float nearDistance = 45.0f;
-            float farDistance = 1200.0f;
-            float proximity = 1.0f - clamp((distance - nearDistance) / (farDistance - nearDistance), 0.0f, 1.0f);
-            proximity = proximity * proximity * proximity;
+        boolean inMatch = screenState == ScreenState.PLAYING;
+        boolean pilotView = localRole == Role.PILOT;
+        boolean shooterView = localRole == Role.TURRET;
+        float distance = gameState.planePosition.copy().sub(gameState.plane2Position).length();
+        float nearDistance = 45.0f;
+        float farDistance = 1200.0f;
+        float proximity = 1.0f - clamp((distance - nearDistance) / (farDistance - nearDistance), 0.0f, 1.0f);
+        proximity = proximity * proximity * proximity;
 
-            float farRumbleFloor = 0.02f;
-            float farMusicFloor = 0.012f;
-            rumbleGain = farRumbleFloor + (PLANE_RUMBLE_BASE_GAIN - farRumbleFloor) * proximity;
-            musicGain = farMusicFloor + (FREE_BIRD_BASE_GAIN - farMusicFloor) * proximity;
-        }
+        float minMusicGain = FREE_BIRD_BASE_GAIN * 0.05f;
+        float proximityMusicGain = minMusicGain + (FREE_BIRD_BASE_GAIN - minMusicGain) * proximity;
+        float audibleMusicGain = musicMuted ? 0.0f : proximityMusicGain;
 
-        audioEngine.setSourceGain(planeRumbleSource, rumbleGain);
-        audioEngine.setSourceGain(freeBirdSource, musicGain);
+        audioEngine.setSourceGain(plane1RumbleSource, pilotView ? PILOT_RUMBLE_GAIN : 0.0f);
+        audioEngine.setSourceGain(plane2RumbleSource, shooterView ? PILOT_RUMBLE_GAIN : 0.0f);
 
-        boolean shouldPlayPlaneAudio = screenState == ScreenState.PLAYING;
-        boolean shouldPlayMusic = shouldPlayPlaneAudio && localRole == Role.TURRET;
-        audioEngine.setLoopPlaying(planeRumbleSource, shouldPlayPlaneAudio);
-        // Demo mode: disable Free Bird for pilot to avoid doubled music when running both clients on one laptop.
-        audioEngine.setLoopPlaying(freeBirdSource, shouldPlayMusic);
+        audioEngine.setSourceGain(plane1FreeBirdSource, shooterView ? audibleMusicGain : 0.0f);
+        audioEngine.setSourceGain(plane2FreeBirdSource, pilotView ? audibleMusicGain : 0.0f);
+
+        audioEngine.setLoopPlaying(plane1RumbleSource, inMatch && pilotView);
+        audioEngine.setLoopPlaying(plane2RumbleSource, inMatch && shooterView);
+
+        // Each player hears only the other player's Free Bird source.
+        audioEngine.setLoopPlaying(plane1FreeBirdSource, inMatch && shooterView && !musicMuted);
+        audioEngine.setLoopPlaying(plane2FreeBirdSource, inMatch && pilotView && !musicMuted);
     }
 
     private void setPerspective(int width, int height) {
@@ -853,13 +894,14 @@ public class App {
         float renderRoll = (localRole == Role.PILOT) ? planeBank : gameState.planeRoll;
         glRotatef(renderRoll, 0.0f, 0.0f, 1.0f);
         glRotatef(-gameState.planePitch, 1.0f, 0.0f, 0.0f);
+        glColor3f(0.15f, 0.2f, 0.9f);
 
         if (planeModel != null && planeModel.isLoaded()) {
             glRotatef(planeModelPitchOffset, 1.0f, 0.0f, 0.0f);
             glRotatef(planeModelRollOffset, 0.0f, 0.0f, 1.0f);
             planeModel.render();
+            glColor3f(1.0f, 1.0f, 1.0f);
         } else {
-            glColor3f(0.15f, 0.2f, 0.9f);
             glBegin(GL_TRIANGLES);
             glVertex3f(0.0f, 0.0f, -6.0f);
             glVertex3f(-1.2f, -0.6f, 3.0f);
@@ -882,19 +924,30 @@ public class App {
         glPopMatrix();
     }
 
-    private void renderTurret() {
-        Vector3 pos = gameState.turretPosition;
+    private void renderPlane2() {
         glPushMatrix();
-        glTranslatef(pos.x, map.getY() + 2.0f, pos.z);
+        glTranslatef(gameState.plane2Position.x, gameState.plane2Position.y, gameState.plane2Position.z);
+        glRotatef(gameState.plane2Yaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(gameState.plane2Roll, 0.0f, 0.0f, 1.0f);
+        glRotatef(-gameState.plane2Pitch, 1.0f, 0.0f, 0.0f);
+        glColor3f(0.85f, 0.15f, 0.15f);
 
-        glColor3f(0.18f, 0.18f, 0.18f);
-        drawCube(5.0f, 2.0f, 5.0f);
+        if (planeModel != null && planeModel.isLoaded()) {
+            glRotatef(planeModelPitchOffset, 1.0f, 0.0f, 0.0f);
+            glRotatef(planeModelRollOffset, 0.0f, 0.0f, 1.0f);
+            planeModel.render();
+            glColor3f(1.0f, 1.0f, 1.0f);
+        } else {
+            glBegin(GL_TRIANGLES);
+            glVertex3f(0.0f, 0.0f, -6.0f);
+            glVertex3f(-1.2f, -0.6f, 3.0f);
+            glVertex3f(1.2f, -0.6f, 3.0f);
 
-        glTranslatef(0.0f, 2.0f, 0.0f);
-        glRotatef(localRole == Role.PILOT ? remoteTurretYaw : localTurretYaw, 0.0f, 1.0f, 0.0f);
-        glRotatef(localRole == Role.PILOT ? remoteTurretPitch : localTurretPitch, 1.0f, 0.0f, 0.0f);
-        glColor3f(0.35f, 0.35f, 0.35f);
-        drawCube(1.0f, 1.0f, 6.0f);
+            glVertex3f(0.0f, 1.0f, -2.0f);
+            glVertex3f(-1.0f, -0.2f, 3.0f);
+            glVertex3f(1.0f, -0.2f, 3.0f);
+            glEnd();
+        }
 
         glPopMatrix();
     }
@@ -1000,10 +1053,10 @@ public class App {
 
         if (screenState == ScreenState.MENU) {
             renderText(20.0f, 70.0f, "PLANE FIGHT BATTLE");
-            renderText(20.0f, 95.0f, "H: Host game (you are Pilot)");
-            renderText(20.0f, 115.0f, "J: Join localhost game (you are Turret)");
-            renderText(20.0f, 145.0f, "Pilot: mouse controls plane and shoots targets");
-            renderText(20.0f, 165.0f, "Turret: first-person gun, shoot the plane");
+            renderText(20.0f, 95.0f, "H: Host game (you are Plane 1)");
+            renderText(20.0f, 115.0f, "J: Join localhost game (you are Plane 2)");
+            renderText(20.0f, 145.0f, "Plane 1: fly through targets");
+            renderText(20.0f, 165.0f, "Plane 2: fly and left-click to shoot Plane 1");
             renderText(20.0f, 195.0f, statusText);
         } else if (screenState == ScreenState.WAITING) {
             renderText(20.0f, 70.0f, "Waiting for other player to join...");
@@ -1013,36 +1066,58 @@ public class App {
         } else if (screenState == ScreenState.COUNTDOWN) {
             renderText(20.0f, 70.0f, "Match starts in: " + Math.max(0, (int) Math.ceil(countdownTimer)));
         } else if (screenState == ScreenState.PLAYING) {
-            renderText(20.0f, 70.0f, "Role: " + localRole);
+            renderText(20.0f, 70.0f, "Role: " + (localRole == Role.PILOT ? "Plane 1" : "Plane 2"));
             renderText(20.0f, 90.0f, "Plane HP: " + (int) gameState.planeHp);
             renderText(20.0f, 110.0f, "Targets destroyed: " + gameState.destroyedTargetCount() + "/" + gameState.targets.size());
 
             if (localRole == Role.PILOT) {
-                renderText(20.0f, 130.0f, "Mouse to fly into targets (no plane shooting)");
+                renderText(20.0f, 130.0f, "Mouse to fly Plane 1 into targets");
+
+                renderText(20.0f, 150.0f, "Boost (hold Space):");
+                float barX = 180.0f;
+                float barY = 142.0f;
+                float barW = 220.0f;
+                float barH = 18.0f;
+
+                glColor3f(0.20f, 0.20f, 0.20f);
+                drawRect2D(barX, barY, barW, barH);
+
+                glColor3f(0.95f, 0.85f, 0.20f);
+                drawRect2D(barX + 2.0f, barY + 2.0f, (barW - 4.0f) * planeBoostEnergy, barH - 4.0f);
+
+                glColor3f(0.05f, 0.05f, 0.05f);
+                renderText(barX + barW + 12.0f, 155.0f, (int) (planeBoostEnergy * 100.0f) + "%");
             } else {
-                renderText(20.0f, 130.0f, "Mouse to aim turret + left click to fire");
+                renderText(20.0f, 130.0f, "Mouse to fly Plane 2 + left click to fire");
             }
 
-            renderText(20.0f, 150.0f, "Esc: pause + free mouse");
+            renderText(20.0f, 190.0f, "Esc: pause + free mouse");
 
             drawCrosshair(width * 0.5f, height * 0.5f, 10.0f);
         } else if (screenState == ScreenState.PAUSED) {
             float buttonW = 220.0f;
             float buttonH = 50.0f;
             float buttonX = width * 0.5f - buttonW * 0.5f;
-            float buttonY = height * 0.5f - buttonH * 0.5f;
+            float resumeY = height * 0.5f - 58.0f;
+            float musicY = resumeY + buttonH + 18.0f;
 
             renderText(20.0f, 70.0f, "Paused");
             renderText(20.0f, 95.0f, "Mouse is free. Click Resume or press Esc.");
 
             glColor3f(0.75f, 0.75f, 0.75f);
-            drawRect2D(buttonX, buttonY, buttonW, buttonH);
+            drawRect2D(buttonX, resumeY, buttonW, buttonH);
             glColor3f(0.05f, 0.05f, 0.05f);
-            renderText(buttonX + 70.0f, buttonY + 30.0f, "RESUME");
+            renderText(buttonX + 70.0f, resumeY + 30.0f, "RESUME");
+
+            glColor3f(0.75f, 0.75f, 0.75f);
+            drawRect2D(buttonX, musicY, buttonW, buttonH);
+            glColor3f(0.05f, 0.05f, 0.05f);
+            renderText(buttonX + 34.0f, musicY + 30.0f, musicMuted ? "UNMUTE MUSIC" : "MUTE MUSIC");
         } else if (screenState == ScreenState.GAME_OVER) {
-            renderText(20.0f, 70.0f, "Game Over");
-            renderText(20.0f, 95.0f, gameOverText);
-            renderText(20.0f, 120.0f, "Press R for main menu");
+            glColor3f(0.95f, 0.95f, 0.95f);
+            renderCenteredTextScaled(width * 0.5f, height * 0.45f, gameOverText, 2.8f);
+            glColor3f(0.05f, 0.05f, 0.05f);
+            renderCenteredTextScaled(width * 0.5f, height * 0.60f, "Press R for main menu", 1.35f);
         }
 
         glEnable(GL_DEPTH_TEST);
@@ -1088,6 +1163,18 @@ public class App {
         glPopMatrix();
     }
 
+    private void renderCenteredTextScaled(float centerX, float y, String text, float scale) {
+        float charWidth = 8.0f;
+        float textWidth = text.length() * charWidth * scale;
+        float x = centerX - textWidth * 0.5f;
+
+        glPushMatrix();
+        glTranslatef(x, y, 0.0f);
+        glScalef(scale, scale, 1.0f);
+        renderText(0.0f, 0.0f, text);
+        glPopMatrix();
+    }
+
     private void onKey(long win, int key, int scancode, int action, int mods) {
         if (action != GLFW_RELEASE) {
             return;
@@ -1118,9 +1205,6 @@ public class App {
             return;
         }
 
-        if (screenState == ScreenState.PLAYING && localRole == Role.TURRET && key == GLFW_KEY_SPACE) {
-            cycleTurretPosition();
-        }
     }
 
     private void hostGame() {
@@ -1131,7 +1215,7 @@ public class App {
             networkPeer = new HostPeer(NET_PORT);
             localRole = Role.PILOT;
             screenState = ScreenState.WAITING;
-            statusText = "Hosting on port " + NET_PORT;
+            statusText = "Hosting Plane 1 on port " + NET_PORT;
         } catch (IOException ex) {
             statusText = "Host failed: " + ex.getMessage();
             screenState = ScreenState.MENU;
@@ -1147,7 +1231,7 @@ public class App {
             networkPeer = new ClientPeer(host, port);
             localRole = Role.TURRET;
             screenState = ScreenState.WAITING;
-            statusText = "Connected. Waiting for host countdown...";
+            statusText = "Connected as Plane 2. Waiting for host countdown...";
         } catch (IOException ex) {
             statusText = "Join failed: " + ex.getMessage();
             screenState = ScreenState.MENU;
@@ -1161,23 +1245,21 @@ public class App {
         localRole = Role.NONE;
         screenState = ScreenState.MENU;
         gameOverText = "";
-        statusText = "Press H to Host (Pilot) or J to Join (Turret)";
+        statusText = "Press H to Host (Plane 1) or J to Join (Plane 2)";
     }
 
     private void resetRound() {
         gameState.reset();
-        setTurretPositionIndex(0);
         respawnTargetsAcrossMap();
-        remoteTurretYaw = 180.0f;
-        remoteTurretPitch = -5.0f;
-        localTurretYaw = 180.0f;
-        localTurretPitch = -5.0f;
+        planeBoostEnergy = 1.0f;
+        planeBoostLockedOut = false;
         countdownTimer = 3.0f;
         localFireCooldown = 0.0f;
         prevLeftMouse = false;
         prevUiLeftMouse = false;
         targetAiPhase = 0.0f;
         planeBank = 0.0f;
+        plane2Bank = 0.0f;
         bulletTraces.clear();
     }
 
@@ -1290,10 +1372,13 @@ public class App {
         float buttonW = 220.0f;
         float buttonH = 50.0f;
         float buttonX = width * 0.5f - buttonW * 0.5f;
-        float buttonY = height * 0.5f - buttonH * 0.5f;
+        float resumeY = height * 0.5f - 58.0f;
+        float musicY = resumeY + buttonH + 18.0f;
 
-        if (cx[0] >= buttonX && cx[0] <= buttonX + buttonW && cy[0] >= buttonY && cy[0] <= buttonY + buttonH) {
+        if (cx[0] >= buttonX && cx[0] <= buttonX + buttonW && cy[0] >= resumeY && cy[0] <= resumeY + buttonH) {
             resumeGame();
+        } else if (cx[0] >= buttonX && cx[0] <= buttonX + buttonW && cy[0] >= musicY && cy[0] <= musicY + buttonH) {
+            musicMuted = !musicMuted;
         }
     }
 
@@ -1481,7 +1566,12 @@ public class App {
         float planeSpeed;
         float planeHp;
 
-        final Vector3 turretPosition = new Vector3(0.0f, 5.0f, 0.0f);
+        final Vector3 plane2Position = new Vector3();
+        float plane2Yaw;
+        float plane2Pitch;
+        float plane2Roll;
+        float plane2Speed;
+
         final List<Vector3> targets = new ArrayList<>();
         boolean[] destroyedTargets = new boolean[0];
 
@@ -1490,10 +1580,15 @@ public class App {
             planeYaw = 180.0f;
             planePitch = 0.0f;
             planeRoll = 0.0f;
-            planeSpeed = 48.0f;
+            planeSpeed = BASE_PLANE_SPEED;
             planeHp = 3.0f;
 
-            turretPosition.set(0.0f, 5.0f, 0.0f);
+            plane2Position.set(0.0f, 26.0f, -170.0f);
+            plane2Yaw = 0.0f;
+            plane2Pitch = 0.0f;
+            plane2Roll = 0.0f;
+            plane2Speed = BASE_PLANE_SPEED;
+
             targets.clear();
             destroyedTargets = new boolean[0];
         }

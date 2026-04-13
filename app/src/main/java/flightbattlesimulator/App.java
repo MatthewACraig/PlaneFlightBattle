@@ -51,6 +51,14 @@ public class App {
     private Map map;
     private ModelLoader planeModel;
     private ModelLoader targetModel;
+    private AudioEngine audioEngine;
+    private int planeRumbleSource = -1;
+    private int freeBirdSource = -1;
+    private int targetGrabbedSource = -1;
+    private int turretShootSource = -1;
+    private static final float PLANE_RUMBLE_BASE_GAIN = 0.18f;
+    private static final float FREE_BIRD_BASE_GAIN = 0.36f;
+    private static final float PILOT_RUMBLE_GAIN = 0.34f;
     private final float planeModelPitchOffset = -90.0f;
     private final float planeModelRollOffset = 180.0f;
     private final float targetModelPitchOffset = -90.0f;
@@ -169,8 +177,56 @@ public class App {
             targetModel = null;
         }
 
+        initAudio();
+
         resetRound();
         return true;
+    }
+
+    private void initAudio() {
+        audioEngine = new AudioEngine();
+        if (!audioEngine.init()) {
+            System.err.println("Audio initialization failed. Continuing without sound.");
+            audioEngine = null;
+            return;
+        }
+
+        planeRumbleSource = audioEngine.createMp3Source(
+            "sounds/plane_rumble.mp3",
+            true,
+            PLANE_RUMBLE_BASE_GAIN,
+            1.0f,
+            32.0f,
+            900.0f,
+            1.15f
+        );
+        freeBirdSource = audioEngine.createMp3Source(
+            "sounds/Free Bird.mp3",
+            true,
+            FREE_BIRD_BASE_GAIN,
+            1.0f,
+            55.0f,
+            1700.0f,
+            0.45f
+        );
+        targetGrabbedSource = audioEngine.createMp3Source(
+            "sounds/target_grabbed.mp3",
+            false,
+            0.95f,
+            1.0f,
+            20.0f,
+            650.0f,
+            1.2f
+        );
+        turretShootSource = audioEngine.createMp3Source(
+            "sounds/turret_shoot.mp3",
+            false,
+            0.9f,
+            1.0f,
+            28.0f,
+            700.0f,
+            1.25f
+        );
     }
 
     private void loop() {
@@ -319,6 +375,10 @@ public class App {
                 0.9f,
                 0.1f
             );
+            if (audioEngine != null) {
+                audioEngine.setSourcePosition(turretShootSource, gameState.turretPosition);
+                audioEngine.playOneShot(turretShootSource);
+            }
             if (networkPeer != null && networkPeer.isConnected()) {
                 networkPeer.send("FIRE_TURRET");
             }
@@ -337,6 +397,10 @@ public class App {
             Vector3 offset = gameState.targets.get(i).copy().sub(gameState.planePosition);
             if (offset.lengthSquared() <= captureRadiusSq) {
                 gameState.destroyedTargets[i] = true;
+                if (audioEngine != null) {
+                    audioEngine.setSourcePosition(targetGrabbedSource, gameState.targets.get(i));
+                    audioEngine.playOneShot(targetGrabbedSource);
+                }
             }
         }
     }
@@ -397,6 +461,10 @@ public class App {
         Vector3 dir = directionFromYawPitch(yaw, pitch);
         Vector3 start = turretOrigin.copy().add(dir.copy().mul(3.5f));
         addBulletTrace(start, start.copy().add(dir.copy().mul(700.0f)), 1.0f, 0.9f, 0.1f);
+        if (audioEngine != null) {
+            audioEngine.setSourcePosition(turretShootSource, turretOrigin);
+            audioEngine.playOneShot(turretShootSource);
+        }
         if (raySphereHit(turretOrigin, dir, gameState.planePosition, 5.5f)) {
             gameState.planeHp -= 1.0f;
             gameState.planeHp = Math.max(0.0f, gameState.planeHp);
@@ -546,6 +614,7 @@ public class App {
 
         setPerspective(width, height);
         setupCameraForCurrentState();
+        updateAudioScene();
 
         map.render();
         renderTurret();
@@ -561,7 +630,7 @@ public class App {
         glLoadIdentity();
 
         if (screenState == ScreenState.MENU || screenState == ScreenState.WAITING || screenState == ScreenState.GAME_OVER) {
-            lookAt(0.0f, 55.0f, 145.0f, 0.0f, 15.0f, 0.0f, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(0.0f, 55.0f, 145.0f, 0.0f, 15.0f, 0.0f, 0.0f, 1.0f, 0.0f);
             return;
         }
 
@@ -571,7 +640,7 @@ public class App {
             cameraPos.y += 6.0f;
 
             Vector3 lookTarget = gameState.planePosition.copy().add(forward.copy().mul(15.0f));
-            lookAt(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
         } else {
             float yaw = (screenState == ScreenState.PLAYING) ? localTurretYaw : 180.0f;
             float pitch = (screenState == ScreenState.PLAYING) ? localTurretPitch : -5.0f;
@@ -580,8 +649,65 @@ public class App {
             Vector3 dir = directionFromYawPitch(yaw, pitch);
             Vector3 target = origin.copy().add(dir.mul(100.0f));
 
-            lookAt(origin.x, origin.y, origin.z, target.x, target.y, target.z, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(origin.x, origin.y, origin.z, target.x, target.y, target.z, 0.0f, 1.0f, 0.0f);
         }
+    }
+
+    private void setCameraAndListener(
+        float eyeX,
+        float eyeY,
+        float eyeZ,
+        float targetX,
+        float targetY,
+        float targetZ,
+        float upX,
+        float upY,
+        float upZ
+    ) {
+        lookAt(eyeX, eyeY, eyeZ, targetX, targetY, targetZ, upX, upY, upZ);
+
+        if (audioEngine != null) {
+            Vector3 listenerPos = new Vector3(eyeX, eyeY, eyeZ);
+            Vector3 listenerForward = new Vector3(targetX - eyeX, targetY - eyeY, targetZ - eyeZ).normalize();
+            Vector3 listenerUp = new Vector3(upX, upY, upZ).normalize();
+            audioEngine.setListener(listenerPos, listenerForward, listenerUp);
+        }
+    }
+
+    private void updateAudioScene() {
+        if (audioEngine == null) {
+            return;
+        }
+
+        audioEngine.setSourcePosition(planeRumbleSource, gameState.planePosition);
+        audioEngine.setSourcePosition(freeBirdSource, gameState.planePosition);
+
+        float rumbleGain = PLANE_RUMBLE_BASE_GAIN;
+        float musicGain = FREE_BIRD_BASE_GAIN;
+        if (localRole == Role.PILOT) {
+            rumbleGain = PILOT_RUMBLE_GAIN;
+            musicGain = 0.0f;
+        } else if (localRole == Role.TURRET) {
+            float distance = gameState.planePosition.copy().sub(gameState.turretPosition).length();
+            float nearDistance = 45.0f;
+            float farDistance = 1200.0f;
+            float proximity = 1.0f - clamp((distance - nearDistance) / (farDistance - nearDistance), 0.0f, 1.0f);
+            proximity = proximity * proximity * proximity;
+
+            float farRumbleFloor = 0.02f;
+            float farMusicFloor = 0.012f;
+            rumbleGain = farRumbleFloor + (PLANE_RUMBLE_BASE_GAIN - farRumbleFloor) * proximity;
+            musicGain = farMusicFloor + (FREE_BIRD_BASE_GAIN - farMusicFloor) * proximity;
+        }
+
+        audioEngine.setSourceGain(planeRumbleSource, rumbleGain);
+        audioEngine.setSourceGain(freeBirdSource, musicGain);
+
+        boolean shouldPlayPlaneAudio = screenState == ScreenState.PLAYING;
+        boolean shouldPlayMusic = shouldPlayPlaneAudio && localRole == Role.TURRET;
+        audioEngine.setLoopPlaying(planeRumbleSource, shouldPlayPlaneAudio);
+        // Demo mode: disable Free Bird for pilot to avoid doubled music when running both clients on one laptop.
+        audioEngine.setLoopPlaying(freeBirdSource, shouldPlayMusic);
     }
 
     private void setPerspective(int width, int height) {
@@ -606,7 +732,7 @@ public class App {
         glPushMatrix();
         glTranslatef(gameState.planePosition.x, gameState.planePosition.y, gameState.planePosition.z);
         glRotatef(gameState.planeYaw, 0.0f, 1.0f, 0.0f);
-        glRotatef(gameState.planePitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(-gameState.planePitch, 1.0f, 0.0f, 0.0f);
 
         if (planeModel != null && planeModel.isLoaded()) {
             glRotatef(planeModelPitchOffset, 1.0f, 0.0f, 0.0f);
@@ -1088,6 +1214,11 @@ public class App {
         if (targetModel != null) {
             targetModel.cleanup();
             targetModel = null;
+        }
+
+        if (audioEngine != null) {
+            audioEngine.cleanup();
+            audioEngine = null;
         }
 
         Callbacks.glfwFreeCallbacks(window);

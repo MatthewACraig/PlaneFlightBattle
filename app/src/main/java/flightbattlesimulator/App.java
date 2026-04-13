@@ -14,6 +14,12 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -23,6 +29,8 @@ import java.nio.IntBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
+import java.util.Enumeration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -36,6 +44,9 @@ public class App {
     private static final int WINDOW_WIDTH = 1280;
     private static final int WINDOW_HEIGHT = 800;
     private static final int NET_PORT = 5000;
+    private static final int DISCOVERY_PORT = 5001;
+    private static final String DISCOVERY_QUERY = "PFB_DISCOVER";
+    private static final String DISCOVERY_RESPONSE_PREFIX = "PFB_HOST|";
 
     private enum ScreenState {
         MENU,
@@ -1204,7 +1215,7 @@ public class App {
         if (screenState == ScreenState.MENU) {
             renderText(20.0f, 70.0f, "PLANE FIGHT BATTLE");
             renderText(20.0f, 95.0f, "H: Host game (you are Plane 1)");
-            renderText(20.0f, 115.0f, "J: Join localhost game (you are Plane 2)");
+            renderText(20.0f, 115.0f, "J: Join LAN game (auto-find host on Wi-Fi)");
             renderText(20.0f, 145.0f, "Plane 1: fly through targets");
             renderText(20.0f, 165.0f, "Plane 2: fly and left-click to shoot Plane 1");
             renderText(20.0f, 195.0f, statusText);
@@ -1345,7 +1356,7 @@ public class App {
             if (key == GLFW_KEY_H) {
                 hostGame();
             } else if (key == GLFW_KEY_J) {
-                joinGame("127.0.0.1", NET_PORT);
+                joinLanGame();
             }
             return;
         }
@@ -1371,6 +1382,86 @@ public class App {
             screenState = ScreenState.MENU;
             localRole = Role.NONE;
         }
+    }
+
+    private void joinLanGame() {
+        String discoveredHost = discoverHostOnLan(1400);
+        if (discoveredHost != null) {
+            joinGame(discoveredHost, NET_PORT);
+            return;
+        }
+
+        statusText = "No LAN host discovered. Trying localhost...";
+        joinGame("127.0.0.1", NET_PORT);
+    }
+
+    private String discoverHostOnLan(int timeoutMs) {
+        byte[] queryBytes = DISCOVERY_QUERY.getBytes(StandardCharsets.UTF_8);
+        byte[] recvBuffer = new byte[256];
+
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setBroadcast(true);
+            socket.setSoTimeout(Math.max(200, timeoutMs));
+
+            List<InetAddress> broadcastAddresses = getBroadcastAddresses();
+            for (InetAddress address : broadcastAddresses) {
+                DatagramPacket packet = new DatagramPacket(queryBytes, queryBytes.length, address, DISCOVERY_PORT);
+                socket.send(packet);
+            }
+
+            long deadline = System.currentTimeMillis() + Math.max(200, timeoutMs);
+            while (System.currentTimeMillis() < deadline) {
+                int remaining = (int) Math.max(60, deadline - System.currentTimeMillis());
+                socket.setSoTimeout(remaining);
+
+                DatagramPacket response = new DatagramPacket(recvBuffer, recvBuffer.length);
+                try {
+                    socket.receive(response);
+                } catch (SocketTimeoutException timeout) {
+                    break;
+                }
+
+                String message = new String(response.getData(), 0, response.getLength(), StandardCharsets.UTF_8);
+                if (message.startsWith(DISCOVERY_RESPONSE_PREFIX)) {
+                    return response.getAddress().getHostAddress();
+                }
+            }
+        } catch (IOException ignored) {
+            return null;
+        }
+
+        return null;
+    }
+
+    private List<InetAddress> getBroadcastAddresses() {
+        List<InetAddress> addresses = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                    continue;
+                }
+
+                for (InterfaceAddress interfaceAddress : networkInterface.getInterfaceAddresses()) {
+                    InetAddress broadcast = interfaceAddress.getBroadcast();
+                    if (broadcast != null && !addresses.contains(broadcast)) {
+                        addresses.add(broadcast);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            InetAddress globalBroadcast = InetAddress.getByName("255.255.255.255");
+            if (!addresses.contains(globalBroadcast)) {
+                addresses.add(globalBroadcast);
+            }
+        } catch (Exception ignored) {
+        }
+
+        return addresses;
     }
 
     private void joinGame(String host, int port) {
@@ -1774,6 +1865,7 @@ public class App {
     private static final class HostPeer implements NetworkPeer {
         private final ServerSocket serverSocket;
         private final ConcurrentLinkedQueue<String> incoming = new ConcurrentLinkedQueue<>();
+        private DatagramSocket discoverySocket;
 
         private volatile Socket clientSocket;
         private volatile PrintWriter writer;
@@ -1782,6 +1874,7 @@ public class App {
         HostPeer(int port) throws IOException {
             serverSocket = new ServerSocket(port);
             serverSocket.setSoTimeout(250);
+            startDiscoveryResponder(port);
 
             Thread acceptThread = new Thread(() -> {
                 while (!closed && clientSocket == null) {
@@ -1830,14 +1923,78 @@ public class App {
 
         @Override
         public String connectionInfo() {
-            return "Hosting on localhost:" + serverSocket.getLocalPort();
+            return "Hosting on " + bestLocalIp() + ":" + serverSocket.getLocalPort();
         }
 
         @Override
         public void close() {
             closed = true;
+            if (discoverySocket != null && !discoverySocket.isClosed()) {
+                discoverySocket.close();
+            }
             tryClose(clientSocket);
             tryClose(serverSocket);
+        }
+
+        private void startDiscoveryResponder(int gamePort) {
+            try {
+                discoverySocket = new DatagramSocket(DISCOVERY_PORT);
+                discoverySocket.setBroadcast(true);
+            } catch (Exception ex) {
+                discoverySocket = null;
+                return;
+            }
+
+            Thread discoveryThread = new Thread(() -> {
+                byte[] buffer = new byte[256];
+                while (!closed && discoverySocket != null && !discoverySocket.isClosed()) {
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    try {
+                        discoverySocket.receive(packet);
+                        String incomingText = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
+                        if (!DISCOVERY_QUERY.equals(incomingText)) {
+                            continue;
+                        }
+
+                        byte[] response = (DISCOVERY_RESPONSE_PREFIX + gamePort).getBytes(StandardCharsets.UTF_8);
+                        DatagramPacket responsePacket = new DatagramPacket(
+                            response,
+                            response.length,
+                            packet.getAddress(),
+                            packet.getPort()
+                        );
+                        discoverySocket.send(responsePacket);
+                    } catch (IOException ignored) {
+                        if (closed) {
+                            break;
+                        }
+                    }
+                }
+            }, "lan-discovery-thread");
+            discoveryThread.setDaemon(true);
+            discoveryThread.start();
+        }
+
+        private String bestLocalIp() {
+            try {
+                Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+                while (interfaces != null && interfaces.hasMoreElements()) {
+                    NetworkInterface networkInterface = interfaces.nextElement();
+                    if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                        continue;
+                    }
+
+                    Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+                    while (addresses.hasMoreElements()) {
+                        InetAddress address = addresses.nextElement();
+                        if (address instanceof Inet4Address && !address.isLoopbackAddress()) {
+                            return address.getHostAddress();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return "localhost";
         }
     }
 

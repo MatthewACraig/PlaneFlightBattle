@@ -5,7 +5,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.IntBuffer;
 import org.lwjgl.assimp.*;
+import org.lwjgl.stb.STBImage;
 import org.lwjgl.system.MemoryUtil;
+
+import static org.lwjgl.opengl.GL11.*;
 
 /**
  * Simple model loader for FBX and other 3D model formats using Assimp
@@ -26,6 +29,7 @@ public class ModelLoader {
     private float scaledHeight = 1.0f;
     private float scaledDepth = 1.0f;
     private boolean boundsCalculated = false;
+    private int textureId = 0;
     
     /**
      * Load a 3D model from the resources directory
@@ -33,6 +37,16 @@ public class ModelLoader {
      * @return true if successfully loaded, false otherwise
      */
     public boolean loadModel(String relativePath) {
+        return loadModel(relativePath, null);
+    }
+
+    /**
+     * Load a 3D model and optionally apply a texture from resources.
+     * @param relativePath Path relative to resources directory
+     * @param textureRelativePath Texture path relative to resources, or null for no texture
+     * @return true if successfully loaded, false otherwise
+     */
+    public boolean loadModel(String relativePath, String textureRelativePath) {
         try {
             // Try multiple possible paths
             Path[] possiblePaths = new Path[] {
@@ -81,6 +95,10 @@ public class ModelLoader {
             
             // Calculate bounds for proper scaling
             calculateBounds();
+
+            if (textureRelativePath != null && !textureRelativePath.isBlank()) {
+                loadTexture(textureRelativePath);
+            }
             
             return true;
         } catch (Exception e) {
@@ -98,6 +116,12 @@ public class ModelLoader {
             System.err.println("No model loaded!");
             return;
         }
+
+        if (textureId != 0) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, textureId);
+            glColor3f(1.0f, 1.0f, 1.0f);
+        }
         
         // Render all meshes in the scene
         for (int i = 0; i < this.scene.mNumMeshes(); i++) {
@@ -105,6 +129,11 @@ public class ModelLoader {
             if (mesh != null) {
                 renderMesh(mesh);
             }
+        }
+
+        if (textureId != 0) {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glDisable(GL_TEXTURE_2D);
         }
     }
     
@@ -212,6 +241,7 @@ public class ModelLoader {
             // Get mesh data
             AIVector3D.Buffer vertices = mesh.mVertices();
             AIVector3D.Buffer normals = mesh.mNormals();
+            AIVector3D.Buffer texCoords = mesh.mTextureCoords(0);
             AIFace.Buffer faces = mesh.mFaces();
             
             if (vertices == null || faces == null) {
@@ -248,6 +278,11 @@ public class ModelLoader {
                         AIVector3D normal = normals.get(index);
                         org.lwjgl.opengl.GL11.glNormal3f(normal.x(), normal.y(), normal.z());
                     }
+
+                    if (textureId != 0 && texCoords != null && index < texCoords.capacity()) {
+                        AIVector3D uv = texCoords.get(index);
+                        org.lwjgl.opengl.GL11.glTexCoord2f(uv.x(), uv.y());
+                    }
                     
                     // Set vertex position with proper scaling and centering
                     AIVector3D vertex = vertices.get(index);
@@ -272,6 +307,11 @@ public class ModelLoader {
             Assimp.aiReleaseImport(this.scene);
             this.scene = null;
         }
+
+        if (textureId != 0) {
+            glDeleteTextures(textureId);
+            textureId = 0;
+        }
     }
     
     public boolean isLoaded() {
@@ -294,5 +334,61 @@ public class ModelLoader {
             calculateBounds();
         }
         return scaledDepth;
+    }
+
+    private void loadTexture(String relativePath) {
+        try {
+            Path[] possiblePaths = new Path[] {
+                Paths.get("app/src/main/resources").resolve(relativePath),
+                Paths.get("src/main/resources").resolve(relativePath),
+                Paths.get("resources").resolve(relativePath),
+                Paths.get(relativePath)
+            };
+
+            Path texturePath = null;
+            for (Path p : possiblePaths) {
+                if (Files.exists(p)) {
+                    texturePath = p;
+                    break;
+                }
+            }
+
+            if (texturePath == null) {
+                System.err.println("Texture file not found: " + relativePath);
+                return;
+            }
+
+            IntBuffer width = MemoryUtil.memAllocInt(1);
+            IntBuffer height = MemoryUtil.memAllocInt(1);
+            IntBuffer channels = MemoryUtil.memAllocInt(1);
+
+            STBImage.stbi_set_flip_vertically_on_load(true);
+            var image = STBImage.stbi_load(texturePath.toAbsolutePath().toString(), width, height, channels, 4);
+            if (image == null) {
+                System.err.println("Failed to load texture: " + STBImage.stbi_failure_reason());
+                MemoryUtil.memFree(width);
+                MemoryUtil.memFree(height);
+                MemoryUtil.memFree(channels);
+                return;
+            }
+
+            textureId = glGenTextures();
+            glBindTexture(GL_TEXTURE_2D, textureId);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width.get(0), height.get(0), 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
+            STBImage.stbi_image_free(image);
+            MemoryUtil.memFree(width);
+            MemoryUtil.memFree(height);
+            MemoryUtil.memFree(channels);
+
+            System.out.println("Loaded texture: " + texturePath.toAbsolutePath());
+        } catch (Exception ex) {
+            System.err.println("Error loading texture: " + ex.getMessage());
+        }
     }
 }

@@ -49,6 +49,12 @@ public class App {
 
     private long window;
     private Map map;
+    private ModelLoader planeModel;
+    private ModelLoader targetModel;
+    private final float planeModelPitchOffset = -90.0f;
+    private final float planeModelRollOffset = 180.0f;
+    private final float targetModelPitchOffset = -90.0f;
+    private final float targetModelScale = 0.14f;
 
     private ScreenState screenState = ScreenState.MENU;
     private Role localRole = Role.NONE;
@@ -70,7 +76,7 @@ public class App {
     private boolean prevLeftMouse = false;
     private boolean prevUiLeftMouse = false;
     private float localFireCooldown = 0.0f;
-    private float lastTargetAiPhase = 0.0f;
+    private float targetAiPhase = 0.0f;
 
     private final List<BulletTrace> bulletTraces = new ArrayList<>();
 
@@ -150,6 +156,19 @@ public class App {
 
         map = new Map(1400.0f);
         map.setY(-2.5f);
+
+        planeModel = new ModelLoader();
+        if (!planeModel.loadModel("plane/planedone.fbx", "dragon_scale_texture.jpg")) {
+            System.err.println("Failed to load plane/planedone.fbx, falling back to simple plane mesh.");
+            planeModel = null;
+        }
+
+        targetModel = new ModelLoader();
+        if (!targetModel.loadModel("cube.obj", "target.jpg")) {
+            System.err.println("Failed to load cube.obj with target.jpg, falling back to red cube targets.");
+            targetModel = null;
+        }
+
         resetRound();
         return true;
     }
@@ -270,7 +289,7 @@ public class App {
         gameState.planePosition.z = clamp(gameState.planePosition.z, -620.0f, 620.0f);
 
         collectTargetsByContact();
-        updateLastTargetEvasion(dt);
+        updateTargetEvasion(dt);
     }
 
     private void updateTurretControls(float dt) {
@@ -291,9 +310,11 @@ public class App {
 
         if (justPressed && localFireCooldown <= 0.0f) {
             localFireCooldown = 0.15f;
+            Vector3 turretDir = directionFromYawPitch(localTurretYaw, localTurretPitch);
+            Vector3 start = gameState.turretPosition.copy().add(turretDir.copy().mul(3.5f));
             addBulletTrace(
-                gameState.turretPosition.copy(),
-                gameState.turretPosition.copy().add(directionFromYawPitch(localTurretYaw, localTurretPitch).mul(700.0f)),
+                start,
+                start.copy().add(turretDir.mul(700.0f)),
                 1.0f,
                 0.9f,
                 0.1f
@@ -320,49 +341,64 @@ public class App {
         }
     }
 
-    private void updateLastTargetEvasion(float dt) {
-        if (gameState.destroyedTargetCount() != gameState.targets.size() - 1) {
-            lastTargetAiPhase = 0.0f;
+    private void updateTargetEvasion(float dt) {
+        int totalTargets = gameState.targets.size();
+        int destroyedCount = gameState.destroyedTargetCount();
+        int remainingTargets = totalTargets - destroyedCount;
+        if (remainingTargets <= 0) {
+            targetAiPhase = 0.0f;
             return;
         }
 
-        int targetIndex = findLastRemainingTargetIndex();
-        if (targetIndex < 0) {
-            return;
+        targetAiPhase += dt;
+
+        float progress = totalTargets > 1 ? (float) destroyedCount / (float) (totalTargets - 1) : 1.0f;
+        float detectRadius = 250.0f;
+        float minSpeed = 8.0f + 10.0f * progress;
+        float maxSpeed = 20.0f + 18.0f * progress;
+        if (remainingTargets == 1) {
+            maxSpeed = gameState.planeSpeed * 0.92f;
+            minSpeed = Math.min(minSpeed, maxSpeed * 0.75f);
         }
 
-        Vector3 targetPos = gameState.targets.get(targetIndex);
-        Vector3 awayFromPlane = targetPos.copy().sub(gameState.planePosition);
-        float distance = awayFromPlane.length();
-        float detectRadius = 230.0f;
+        for (int i = 0; i < totalTargets; i++) {
+            if (gameState.destroyedTargets[i]) {
+                continue;
+            }
 
-        if (distance <= 0.001f || distance > detectRadius) {
-            return;
+            Vector3 targetPos = gameState.targets.get(i);
+            Vector3 awayFromPlane = targetPos.copy().sub(gameState.planePosition);
+            float distance = awayFromPlane.length();
+            if (distance <= 0.001f || distance > detectRadius) {
+                continue;
+            }
+
+            awayFromPlane.normalize();
+            float phase = targetAiPhase * (2.0f + progress * 0.7f) + (i * 1.37f);
+
+            Vector3 lateral = new Vector3(-awayFromPlane.z, 0.0f, awayFromPlane.x).normalize();
+            lateral.mul((float) Math.sin(phase) * (0.25f + progress * 0.45f));
+
+            float urgency = 1.0f - (distance / detectRadius);
+            float speed = minSpeed + urgency * (maxSpeed - minSpeed);
+
+            Vector3 movement = awayFromPlane.copy().add(lateral).normalize().mul(speed * dt);
+            targetPos.add(movement);
+
+            float bob = (float) Math.sin(phase * 1.6f) * (0.7f + progress * 1.4f);
+            targetPos.y = clamp(targetPos.y + bob * dt, 14.0f, 34.0f);
+            targetPos.x = clamp(targetPos.x, -560.0f, 560.0f);
+            targetPos.z = clamp(targetPos.z, -560.0f, 560.0f);
         }
-
-        awayFromPlane.normalize();
-        lastTargetAiPhase += dt * 2.3f;
-
-        Vector3 lateral = new Vector3(-awayFromPlane.z, 0.0f, awayFromPlane.x).normalize();
-        lateral.mul((float) Math.sin(lastTargetAiPhase) * 0.55f);
-
-        float urgency = 1.0f - (distance / detectRadius);
-        float speed = 10.0f + urgency * 16.0f;
-
-        Vector3 movement = awayFromPlane.add(lateral).normalize().mul(speed * dt);
-        targetPos.add(movement);
-
-        targetPos.y = clamp(targetPos.y + (float) Math.sin(lastTargetAiPhase * 1.9f) * 1.4f * dt, 14.0f, 32.0f);
-        targetPos.x = clamp(targetPos.x, -560.0f, 560.0f);
-        targetPos.z = clamp(targetPos.z, -560.0f, 560.0f);
     }
 
     private void handleTurretShot(float yaw, float pitch) {
         Vector3 turretOrigin = gameState.turretPosition.copy();
         Vector3 dir = directionFromYawPitch(yaw, pitch);
-        addBulletTrace(turretOrigin.copy(), turretOrigin.copy().add(dir.copy().mul(700.0f)), 1.0f, 0.9f, 0.1f);
+        Vector3 start = turretOrigin.copy().add(dir.copy().mul(3.5f));
+        addBulletTrace(start, start.copy().add(dir.copy().mul(700.0f)), 1.0f, 0.9f, 0.1f);
         if (raySphereHit(turretOrigin, dir, gameState.planePosition, 5.5f)) {
-            gameState.planeHp -= 10.0f;
+            gameState.planeHp -= 1.0f;
             gameState.planeHp = Math.max(0.0f, gameState.planeHp);
         }
     }
@@ -372,30 +408,23 @@ public class App {
             return;
         }
 
-        int lastTargetIndex = findLastRemainingTargetIndex();
-        float lastTargetX = 0.0f;
-        float lastTargetY = 0.0f;
-        float lastTargetZ = 0.0f;
-        if (lastTargetIndex >= 0) {
-            Vector3 target = gameState.targets.get(lastTargetIndex);
-            lastTargetX = target.x;
-            lastTargetY = target.y;
-            lastTargetZ = target.z;
+        StringBuilder message = new StringBuilder("SNAP|")
+            .append(gameState.planePosition.x).append('|')
+            .append(gameState.planePosition.y).append('|')
+            .append(gameState.planePosition.z).append('|')
+            .append(gameState.planeYaw).append('|')
+            .append(gameState.planePitch).append('|')
+            .append(gameState.planeHp).append('|')
+            .append(targetMask());
+
+        for (int i = 0; i < gameState.targets.size(); i++) {
+            Vector3 target = gameState.targets.get(i);
+            message.append('|').append(target.x);
+            message.append('|').append(target.y);
+            message.append('|').append(target.z);
         }
 
-        String message = "SNAP|"
-            + gameState.planePosition.x + "|"
-            + gameState.planePosition.y + "|"
-            + gameState.planePosition.z + "|"
-            + gameState.planeYaw + "|"
-            + gameState.planePitch + "|"
-            + gameState.planeHp + "|"
-            + targetMask() + "|"
-            + lastTargetX + "|"
-            + lastTargetY + "|"
-            + lastTargetZ;
-
-        networkPeer.send(message);
+        networkPeer.send(message.toString());
     }
 
     private int findLastRemainingTargetIndex() {
@@ -480,7 +509,19 @@ public class App {
                     gameState.planeHp = parseFloatSafe(parts[6], gameState.planeHp);
                     applyTargetMask((int) parseFloatSafe(parts[7], targetMask()));
 
-                    if (parts.length >= 11) {
+                    int expectedPartCount = 8 + gameState.targets.size() * 3;
+                    if (parts.length >= expectedPartCount) {
+                        int partIndex = 8;
+                        for (int i = 0; i < gameState.targets.size(); i++) {
+                            Vector3 target = gameState.targets.get(i);
+                            target.set(
+                                parseFloatSafe(parts[partIndex], target.x),
+                                parseFloatSafe(parts[partIndex + 1], target.y),
+                                parseFloatSafe(parts[partIndex + 2], target.z)
+                            );
+                            partIndex += 3;
+                        }
+                    } else if (parts.length >= 11) {
                         int lastTargetIndex = findLastRemainingTargetIndex();
                         if (lastTargetIndex >= 0) {
                             gameState.targets.get(lastTargetIndex).set(
@@ -567,24 +608,30 @@ public class App {
         glRotatef(gameState.planeYaw, 0.0f, 1.0f, 0.0f);
         glRotatef(gameState.planePitch, 1.0f, 0.0f, 0.0f);
 
-        glColor3f(0.15f, 0.2f, 0.9f);
-        glBegin(GL_TRIANGLES);
-        glVertex3f(0.0f, 0.0f, -6.0f);
-        glVertex3f(-1.2f, -0.6f, 3.0f);
-        glVertex3f(1.2f, -0.6f, 3.0f);
+        if (planeModel != null && planeModel.isLoaded()) {
+            glRotatef(planeModelPitchOffset, 1.0f, 0.0f, 0.0f);
+            glRotatef(planeModelRollOffset, 0.0f, 0.0f, 1.0f);
+            planeModel.render();
+        } else {
+            glColor3f(0.15f, 0.2f, 0.9f);
+            glBegin(GL_TRIANGLES);
+            glVertex3f(0.0f, 0.0f, -6.0f);
+            glVertex3f(-1.2f, -0.6f, 3.0f);
+            glVertex3f(1.2f, -0.6f, 3.0f);
 
-        glVertex3f(0.0f, 1.0f, -2.0f);
-        glVertex3f(-1.0f, -0.2f, 3.0f);
-        glVertex3f(1.0f, -0.2f, 3.0f);
-        glEnd();
+            glVertex3f(0.0f, 1.0f, -2.0f);
+            glVertex3f(-1.0f, -0.2f, 3.0f);
+            glVertex3f(1.0f, -0.2f, 3.0f);
+            glEnd();
 
-        glColor3f(0.1f, 0.1f, 0.6f);
-        glBegin(GL_QUADS);
-        glVertex3f(-8.0f, 0.0f, 0.5f);
-        glVertex3f(8.0f, 0.0f, 0.5f);
-        glVertex3f(8.0f, 0.0f, 2.0f);
-        glVertex3f(-8.0f, 0.0f, 2.0f);
-        glEnd();
+            glColor3f(0.1f, 0.1f, 0.6f);
+            glBegin(GL_QUADS);
+            glVertex3f(-8.0f, 0.0f, 0.5f);
+            glVertex3f(8.0f, 0.0f, 0.5f);
+            glVertex3f(8.0f, 0.0f, 2.0f);
+            glVertex3f(-8.0f, 0.0f, 2.0f);
+            glEnd();
+        }
 
         glPopMatrix();
     }
@@ -616,8 +663,14 @@ public class App {
             glPushMatrix();
             glTranslatef(p.x, p.y, p.z);
 
-            glColor3f(0.9f, 0.1f, 0.1f);
-            drawCube(4.0f, 4.0f, 4.0f);
+            if (targetModel != null && targetModel.isLoaded()) {
+                glRotatef(targetModelPitchOffset, 1.0f, 0.0f, 0.0f);
+                glScalef(targetModelScale, targetModelScale, targetModelScale);
+                targetModel.render();
+            } else {
+                glColor3f(0.9f, 0.1f, 0.1f);
+                drawCube(4.0f, 4.0f, 4.0f);
+            }
 
             glDisable(GL_LIGHTING);
             glColor3f(1.0f, 1.0f, 1.0f);
@@ -870,7 +923,7 @@ public class App {
         localFireCooldown = 0.0f;
         prevLeftMouse = false;
         prevUiLeftMouse = false;
-        lastTargetAiPhase = 0.0f;
+        targetAiPhase = 0.0f;
         bulletTraces.clear();
     }
 
@@ -928,6 +981,7 @@ public class App {
         }
 
         glDisable(GL_LIGHTING);
+        glDisable(GL_DEPTH_TEST);
         glLineWidth(3.0f);
         glBegin(GL_LINES);
         for (BulletTrace trace : bulletTraces) {
@@ -938,6 +992,7 @@ public class App {
         }
         glEnd();
         glLineWidth(1.0f);
+        glEnable(GL_DEPTH_TEST);
         glEnable(GL_LIGHTING);
     }
 
@@ -1024,6 +1079,16 @@ public class App {
 
     private void cleanup() {
         closeNetwork();
+
+        if (planeModel != null) {
+            planeModel.cleanup();
+            planeModel = null;
+        }
+
+        if (targetModel != null) {
+            targetModel.cleanup();
+            targetModel = null;
+        }
 
         Callbacks.glfwFreeCallbacks(window);
         glfwDestroyWindow(window);
@@ -1160,7 +1225,7 @@ public class App {
             planeYaw = 180.0f;
             planePitch = 0.0f;
             planeSpeed = 48.0f;
-            planeHp = 100.0f;
+            planeHp = 3.0f;
 
             targets.clear();
             targets.add(new Vector3(-130.0f, 20.0f, -80.0f));

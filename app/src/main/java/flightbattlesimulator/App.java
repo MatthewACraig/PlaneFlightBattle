@@ -1216,6 +1216,11 @@ public class App {
             targetModel = null;
         }
 
+        if (map != null) {
+            map.cleanup();
+            map = null;
+        }
+
         if (audioEngine != null) {
             audioEngine.cleanup();
             audioEngine = null;

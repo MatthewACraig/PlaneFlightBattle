@@ -37,6 +37,7 @@ public class App {
         WAITING,
         COUNTDOWN,
         PLAYING,
+        PAUSED,
         GAME_OVER
     }
 
@@ -59,6 +60,7 @@ public class App {
     private String statusText = "Press H to Host (Pilot) or J to Join (Turret)";
     private String gameOverText = "";
     private float countdownTimer = 3.0f;
+    private ScreenState pausedReturnState = ScreenState.PLAYING;
 
     private boolean cursorCaptured = false;
     private boolean firstMouseSample = true;
@@ -66,7 +68,11 @@ public class App {
     private double lastMouseY;
 
     private boolean prevLeftMouse = false;
+    private boolean prevUiLeftMouse = false;
     private float localFireCooldown = 0.0f;
+    private float lastTargetAiPhase = 0.0f;
+
+    private final List<BulletTrace> bulletTraces = new ArrayList<>();
 
     // Turret state sent from client to host
     private float remoteTurretYaw = 180.0f;
@@ -195,6 +201,12 @@ public class App {
 
     private void updateState(float dt) {
         updateCursorCapture();
+        updateBulletTraces(dt);
+
+        if (screenState == ScreenState.PAUSED) {
+            updatePauseMenuInput();
+            return;
+        }
 
         if (screenState == ScreenState.WAITING) {
             if (networkPeer != null && networkPeer.isConnected()) {
@@ -246,7 +258,7 @@ public class App {
         Vector2 mouseDelta = sampleMouseDelta();
         float sensitivity = 0.1f;
 
-        gameState.planeYaw += mouseDelta.x * sensitivity;
+        gameState.planeYaw -= mouseDelta.x * sensitivity;
         gameState.planePitch -= mouseDelta.y * sensitivity;
         gameState.planePitch = clamp(gameState.planePitch, -35.0f, 35.0f);
 
@@ -257,21 +269,15 @@ public class App {
         gameState.planePosition.x = clamp(gameState.planePosition.x, -620.0f, 620.0f);
         gameState.planePosition.z = clamp(gameState.planePosition.z, -620.0f, 620.0f);
 
-        boolean leftPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        boolean justPressed = leftPressed && !prevLeftMouse;
-        prevLeftMouse = leftPressed;
-
-        if (justPressed && localFireCooldown <= 0.0f) {
-            localFireCooldown = 0.15f;
-            shootTargetsFromPlane();
-        }
+        collectTargetsByContact();
+        updateLastTargetEvasion(dt);
     }
 
     private void updateTurretControls(float dt) {
         Vector2 mouseDelta = sampleMouseDelta();
         float sensitivity = 0.12f;
 
-        localTurretYaw += mouseDelta.x * sensitivity;
+        localTurretYaw -= mouseDelta.x * sensitivity;
         localTurretPitch -= mouseDelta.y * sensitivity;
         localTurretPitch = clamp(localTurretPitch, -70.0f, 35.0f);
 
@@ -285,32 +291,76 @@ public class App {
 
         if (justPressed && localFireCooldown <= 0.0f) {
             localFireCooldown = 0.15f;
+            addBulletTrace(
+                gameState.turretPosition.copy(),
+                gameState.turretPosition.copy().add(directionFromYawPitch(localTurretYaw, localTurretPitch).mul(700.0f)),
+                1.0f,
+                0.9f,
+                0.1f
+            );
             if (networkPeer != null && networkPeer.isConnected()) {
                 networkPeer.send("FIRE_TURRET");
             }
         }
     }
 
-    private void shootTargetsFromPlane() {
-        Vector3 origin = gameState.planePosition.copy();
-        Vector3 dir = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
+    private void collectTargetsByContact() {
+        float captureRadius = 8.0f;
+        float captureRadiusSq = captureRadius * captureRadius;
 
         for (int i = 0; i < gameState.targets.size(); i++) {
             if (gameState.destroyedTargets[i]) {
                 continue;
             }
 
-            Vector3 target = gameState.targets.get(i);
-            if (raySphereHit(origin, dir, target, 4.0f)) {
+            Vector3 offset = gameState.targets.get(i).copy().sub(gameState.planePosition);
+            if (offset.lengthSquared() <= captureRadiusSq) {
                 gameState.destroyedTargets[i] = true;
-                break;
             }
         }
+    }
+
+    private void updateLastTargetEvasion(float dt) {
+        if (gameState.destroyedTargetCount() != gameState.targets.size() - 1) {
+            lastTargetAiPhase = 0.0f;
+            return;
+        }
+
+        int targetIndex = findLastRemainingTargetIndex();
+        if (targetIndex < 0) {
+            return;
+        }
+
+        Vector3 targetPos = gameState.targets.get(targetIndex);
+        Vector3 awayFromPlane = targetPos.copy().sub(gameState.planePosition);
+        float distance = awayFromPlane.length();
+        float detectRadius = 230.0f;
+
+        if (distance <= 0.001f || distance > detectRadius) {
+            return;
+        }
+
+        awayFromPlane.normalize();
+        lastTargetAiPhase += dt * 2.3f;
+
+        Vector3 lateral = new Vector3(-awayFromPlane.z, 0.0f, awayFromPlane.x).normalize();
+        lateral.mul((float) Math.sin(lastTargetAiPhase) * 0.55f);
+
+        float urgency = 1.0f - (distance / detectRadius);
+        float speed = 10.0f + urgency * 16.0f;
+
+        Vector3 movement = awayFromPlane.add(lateral).normalize().mul(speed * dt);
+        targetPos.add(movement);
+
+        targetPos.y = clamp(targetPos.y + (float) Math.sin(lastTargetAiPhase * 1.9f) * 1.4f * dt, 14.0f, 32.0f);
+        targetPos.x = clamp(targetPos.x, -560.0f, 560.0f);
+        targetPos.z = clamp(targetPos.z, -560.0f, 560.0f);
     }
 
     private void handleTurretShot(float yaw, float pitch) {
         Vector3 turretOrigin = gameState.turretPosition.copy();
         Vector3 dir = directionFromYawPitch(yaw, pitch);
+        addBulletTrace(turretOrigin.copy(), turretOrigin.copy().add(dir.copy().mul(700.0f)), 1.0f, 0.9f, 0.1f);
         if (raySphereHit(turretOrigin, dir, gameState.planePosition, 5.5f)) {
             gameState.planeHp -= 10.0f;
             gameState.planeHp = Math.max(0.0f, gameState.planeHp);
@@ -322,6 +372,17 @@ public class App {
             return;
         }
 
+        int lastTargetIndex = findLastRemainingTargetIndex();
+        float lastTargetX = 0.0f;
+        float lastTargetY = 0.0f;
+        float lastTargetZ = 0.0f;
+        if (lastTargetIndex >= 0) {
+            Vector3 target = gameState.targets.get(lastTargetIndex);
+            lastTargetX = target.x;
+            lastTargetY = target.y;
+            lastTargetZ = target.z;
+        }
+
         String message = "SNAP|"
             + gameState.planePosition.x + "|"
             + gameState.planePosition.y + "|"
@@ -329,9 +390,21 @@ public class App {
             + gameState.planeYaw + "|"
             + gameState.planePitch + "|"
             + gameState.planeHp + "|"
-            + targetMask();
+            + targetMask() + "|"
+            + lastTargetX + "|"
+            + lastTargetY + "|"
+            + lastTargetZ;
 
         networkPeer.send(message);
+    }
+
+    private int findLastRemainingTargetIndex() {
+        for (int i = 0; i < gameState.destroyedTargets.length; i++) {
+            if (!gameState.destroyedTargets[i]) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private int targetMask() {
@@ -406,6 +479,17 @@ public class App {
                     gameState.planePitch = parseFloatSafe(parts[5], gameState.planePitch);
                     gameState.planeHp = parseFloatSafe(parts[6], gameState.planeHp);
                     applyTargetMask((int) parseFloatSafe(parts[7], targetMask()));
+
+                    if (parts.length >= 11) {
+                        int lastTargetIndex = findLastRemainingTargetIndex();
+                        if (lastTargetIndex >= 0) {
+                            gameState.targets.get(lastTargetIndex).set(
+                                parseFloatSafe(parts[8], gameState.targets.get(lastTargetIndex).x),
+                                parseFloatSafe(parts[9], gameState.targets.get(lastTargetIndex).y),
+                                parseFloatSafe(parts[10], gameState.targets.get(lastTargetIndex).z)
+                            );
+                        }
+                    }
                 } else if ("END".equals(parts[0]) && parts.length >= 2) {
                     screenState = ScreenState.GAME_OVER;
                     gameOverText = "PILOT".equals(parts[1])
@@ -426,6 +510,7 @@ public class App {
         renderTurret();
         renderPlane();
         renderTargets();
+        renderBulletTraces();
 
         renderOverlay(width, height);
     }
@@ -634,12 +719,27 @@ public class App {
             renderText(20.0f, 110.0f, "Targets destroyed: " + gameState.destroyedTargetCount() + "/" + gameState.targets.size());
 
             if (localRole == Role.PILOT) {
-                renderText(20.0f, 130.0f, "Mouse to fly + left click to shoot targets");
+                renderText(20.0f, 130.0f, "Mouse to fly into targets (no plane shooting)");
             } else {
                 renderText(20.0f, 130.0f, "Mouse to aim turret + left click to fire");
             }
 
+            renderText(20.0f, 150.0f, "Esc: pause + free mouse");
+
             drawCrosshair(width * 0.5f, height * 0.5f, 10.0f);
+        } else if (screenState == ScreenState.PAUSED) {
+            float buttonW = 220.0f;
+            float buttonH = 50.0f;
+            float buttonX = width * 0.5f - buttonW * 0.5f;
+            float buttonY = height * 0.5f - buttonH * 0.5f;
+
+            renderText(20.0f, 70.0f, "Paused");
+            renderText(20.0f, 95.0f, "Mouse is free. Click Resume or press Esc.");
+
+            glColor3f(0.75f, 0.75f, 0.75f);
+            drawRect2D(buttonX, buttonY, buttonW, buttonH);
+            glColor3f(0.05f, 0.05f, 0.05f);
+            renderText(buttonX + 70.0f, buttonY + 30.0f, "RESUME");
         } else if (screenState == ScreenState.GAME_OVER) {
             renderText(20.0f, 70.0f, "Game Over");
             renderText(20.0f, 95.0f, gameOverText);
@@ -661,6 +761,15 @@ public class App {
         glVertex2f(x + size, y);
         glVertex2f(x, y - size);
         glVertex2f(x, y + size);
+        glEnd();
+    }
+
+    private void drawRect2D(float x, float y, float width, float height) {
+        glBegin(GL_QUADS);
+        glVertex2f(x, y);
+        glVertex2f(x + width, y);
+        glVertex2f(x + width, y + height);
+        glVertex2f(x, y + height);
         glEnd();
     }
 
@@ -686,7 +795,13 @@ public class App {
         }
 
         if (key == GLFW_KEY_ESCAPE) {
-            glfwSetWindowShouldClose(win, true);
+            if (screenState == ScreenState.PLAYING || screenState == ScreenState.COUNTDOWN) {
+                pauseGame();
+            } else if (screenState == ScreenState.PAUSED) {
+                resumeGame();
+            } else {
+                glfwSetWindowShouldClose(win, true);
+            }
             return;
         }
 
@@ -754,6 +869,9 @@ public class App {
         countdownTimer = 3.0f;
         localFireCooldown = 0.0f;
         prevLeftMouse = false;
+        prevUiLeftMouse = false;
+        lastTargetAiPhase = 0.0f;
+        bulletTraces.clear();
     }
 
     private void updateCursorCapture() {
@@ -788,6 +906,86 @@ public class App {
         lastMouseX = x[0];
         lastMouseY = y[0];
         return new Vector2(dx, dy);
+    }
+
+    private void updateBulletTraces(float dt) {
+        for (int i = bulletTraces.size() - 1; i >= 0; i--) {
+            BulletTrace trace = bulletTraces.get(i);
+            trace.ttl -= dt;
+            if (trace.ttl <= 0.0f) {
+                bulletTraces.remove(i);
+            }
+        }
+    }
+
+    private void addBulletTrace(Vector3 start, Vector3 end, float r, float g, float b) {
+        bulletTraces.add(new BulletTrace(start, end, r, g, b, 0.18f));
+    }
+
+    private void renderBulletTraces() {
+        if (bulletTraces.isEmpty()) {
+            return;
+        }
+
+        glDisable(GL_LIGHTING);
+        glLineWidth(3.0f);
+        glBegin(GL_LINES);
+        for (BulletTrace trace : bulletTraces) {
+            float t = clamp(trace.ttl / trace.maxTtl, 0.0f, 1.0f);
+            glColor3f(trace.r * t, trace.g * t, trace.b * t);
+            glVertex3f(trace.start.x, trace.start.y, trace.start.z);
+            glVertex3f(trace.end.x, trace.end.y, trace.end.z);
+        }
+        glEnd();
+        glLineWidth(1.0f);
+        glEnable(GL_LIGHTING);
+    }
+
+    private void pauseGame() {
+        pausedReturnState = screenState;
+        screenState = ScreenState.PAUSED;
+        prevLeftMouse = false;
+        prevUiLeftMouse = false;
+    }
+
+    private void resumeGame() {
+        screenState = pausedReturnState;
+        prevLeftMouse = false;
+        prevUiLeftMouse = false;
+        firstMouseSample = true;
+    }
+
+    private void updatePauseMenuInput() {
+        boolean leftPressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        boolean justPressed = leftPressed && !prevUiLeftMouse;
+        prevUiLeftMouse = leftPressed;
+
+        if (!justPressed) {
+            return;
+        }
+
+        double[] cx = new double[1];
+        double[] cy = new double[1];
+        glfwGetCursorPos(window, cx, cy);
+
+        int width;
+        int height;
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer w = stack.mallocInt(1);
+            IntBuffer h = stack.mallocInt(1);
+            glfwGetWindowSize(window, w, h);
+            width = Math.max(1, w.get(0));
+            height = Math.max(1, h.get(0));
+        }
+
+        float buttonW = 220.0f;
+        float buttonH = 50.0f;
+        float buttonX = width * 0.5f - buttonW * 0.5f;
+        float buttonY = height * 0.5f - buttonH * 0.5f;
+
+        if (cx[0] >= buttonX && cx[0] <= buttonX + buttonW && cy[0] >= buttonY && cy[0] <= buttonY + buttonH) {
+            resumeGame();
+        }
     }
 
     private Vector3 directionFromYawPitch(float yawDeg, float pitchDeg) {
@@ -923,6 +1121,26 @@ public class App {
         Vector2(float x, float y) {
             this.x = x;
             this.y = y;
+        }
+    }
+
+    private static final class BulletTrace {
+        final Vector3 start;
+        final Vector3 end;
+        final float r;
+        final float g;
+        final float b;
+        final float maxTtl;
+        float ttl;
+
+        BulletTrace(Vector3 start, Vector3 end, float r, float g, float b, float ttl) {
+            this.start = start;
+            this.end = end;
+            this.r = r;
+            this.g = g;
+            this.b = b;
+            this.maxTtl = ttl;
+            this.ttl = ttl;
         }
     }
 

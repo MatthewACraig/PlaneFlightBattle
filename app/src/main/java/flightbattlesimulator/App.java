@@ -6,6 +6,7 @@ import org.lwjgl.glfw.GLFWErrorCallback;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.stb.STBEasyFont;
+import org.lwjgl.stb.STBImage;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
@@ -19,6 +20,9 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -52,6 +56,7 @@ public class App {
     private Map map;
     private ModelLoader planeModel;
     private ModelLoader targetModel;
+    private int targetTextureId = 0;
     private AudioEngine audioEngine;
     private int plane1RumbleSource = -1;
     private int plane2RumbleSource = -1;
@@ -181,6 +186,8 @@ public class App {
             System.err.println("Failed to load cube.obj with target.jpg, falling back to red cube targets.");
             targetModel = null;
         }
+
+        targetTextureId = loadTextureFromResources("target.jpg");
 
         initAudio();
 
@@ -381,7 +388,7 @@ public class App {
         gameState.planePosition.add(forward.mul(gameState.planeSpeed * speedMultiplier * dt));
 
         float terrainFloor = map != null ? map.getHeightAt(gameState.planePosition.x, gameState.planePosition.z) : 0.0f;
-        float minAltitude = Math.max(-86.0f, terrainFloor);
+        float minAltitude = Math.max(-92.0f, terrainFloor);
         gameState.planePosition.y = clamp(gameState.planePosition.y, minAltitude, 120.0f);
         gameState.planePosition.x = clamp(gameState.planePosition.x, -620.0f, 620.0f);
         gameState.planePosition.z = clamp(gameState.planePosition.z, -620.0f, 620.0f);
@@ -407,7 +414,7 @@ public class App {
         gameState.plane2Position.add(forward.mul(gameState.plane2Speed * dt));
 
         float terrainFloor = map != null ? map.getHeightAt(gameState.plane2Position.x, gameState.plane2Position.z) : 0.0f;
-        float minAltitude = Math.max(-86.0f, terrainFloor);
+        float minAltitude = Math.max(-92.0f, terrainFloor);
         gameState.plane2Position.y = clamp(gameState.plane2Position.y, minAltitude, 120.0f);
         gameState.plane2Position.x = clamp(gameState.plane2Position.x, -620.0f, 620.0f);
         gameState.plane2Position.z = clamp(gameState.plane2Position.z, -620.0f, 620.0f);
@@ -962,7 +969,14 @@ public class App {
             glPushMatrix();
             glTranslatef(p.x, p.y, p.z);
 
-            if (targetModel != null && targetModel.isLoaded()) {
+            if (targetTextureId != 0) {
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, targetTextureId);
+                glColor3f(1.0f, 1.0f, 1.0f);
+                drawTexturedCube(4.0f, 4.0f, 4.0f);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glDisable(GL_TEXTURE_2D);
+            } else if (targetModel != null && targetModel.isLoaded()) {
                 glRotatef(targetModelPitchOffset, 1.0f, 0.0f, 0.0f);
                 glScalef(targetModelScale, targetModelScale, targetModelScale);
                 targetModel.render();
@@ -1033,6 +1047,142 @@ public class App {
         glVertex3f(hx, hy, -hz);
         glVertex3f(hx, -hy, -hz);
         glEnd();
+    }
+
+    private void drawTexturedCube(float width, float height, float depth) {
+        float hx = width * 0.5f;
+        float hy = height * 0.5f;
+        float hz = depth * 0.5f;
+
+        glBegin(GL_QUADS);
+
+        glNormal3f(0, 1, 0);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(-hx, hy, -hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(hx, hy, -hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(hx, hy, hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(-hx, hy, hz);
+
+        glNormal3f(0, -1, 0);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(-hx, -hy, hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(hx, -hy, hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(hx, -hy, -hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(-hx, -hy, -hz);
+
+        glNormal3f(0, 0, 1);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(-hx, -hy, hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(-hx, hy, hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(hx, hy, hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(hx, -hy, hz);
+
+        glNormal3f(0, 0, -1);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(hx, -hy, -hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(hx, hy, -hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(-hx, hy, -hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(-hx, -hy, -hz);
+
+        glNormal3f(-1, 0, 0);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(-hx, -hy, -hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(-hx, hy, -hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(-hx, hy, hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(-hx, -hy, hz);
+
+        glNormal3f(1, 0, 0);
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex3f(hx, -hy, hz);
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex3f(hx, hy, hz);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex3f(hx, hy, -hz);
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex3f(hx, -hy, -hz);
+
+        glEnd();
+    }
+
+    private int loadTextureFromResources(String relativePath) {
+        Path texturePath = resolveResourcePath(relativePath);
+        if (texturePath == null) {
+            return 0;
+        }
+
+        ByteBuffer imageData;
+        try {
+            imageData = MemoryUtil.memAlloc((int) Files.size(texturePath));
+            imageData.put(Files.readAllBytes(texturePath)).flip();
+        } catch (Exception ex) {
+            System.err.println("Failed to read texture " + relativePath + ": " + ex.getMessage());
+            return 0;
+        }
+
+        int textureId = 0;
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer w = stack.mallocInt(1);
+            IntBuffer h = stack.mallocInt(1);
+            IntBuffer channels = stack.mallocInt(1);
+
+            STBImage.stbi_set_flip_vertically_on_load(true);
+            ByteBuffer pixels = STBImage.stbi_load_from_memory(imageData, w, h, channels, 4);
+            if (pixels == null) {
+                return 0;
+            }
+
+            textureId = glGenTextures();
+            glBindTexture(GL_TEXTURE_2D, textureId);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w.get(0), h.get(0), 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
+            STBImage.stbi_image_free(pixels);
+        } catch (Exception ex) {
+            if (textureId != 0) {
+                glDeleteTextures(textureId);
+            }
+            textureId = 0;
+            System.err.println("Failed to load texture " + relativePath + ": " + ex.getMessage());
+        } finally {
+            MemoryUtil.memFree(imageData);
+        }
+
+        return textureId;
+    }
+
+    private Path resolveResourcePath(String relativePath) {
+        Path[] possiblePaths = new Path[] {
+            Paths.get("app/src/main/resources").resolve(relativePath),
+            Paths.get("src/main/resources").resolve(relativePath),
+            Paths.get("resources").resolve(relativePath),
+            Paths.get(relativePath)
+        };
+
+        for (Path path : possiblePaths) {
+            if (Files.exists(path)) {
+                return path;
+            }
+        }
+        return null;
     }
 
     private void renderOverlay(int width, int height) {
@@ -1427,6 +1577,11 @@ public class App {
         if (targetModel != null) {
             targetModel.cleanup();
             targetModel = null;
+        }
+
+        if (targetTextureId != 0) {
+            glDeleteTextures(targetTextureId);
+            targetTextureId = 0;
         }
 
         if (map != null) {

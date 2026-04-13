@@ -21,6 +21,7 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.lwjgl.glfw.GLFW.*;
@@ -63,6 +64,9 @@ public class App {
     private final float planeModelRollOffset = 180.0f;
     private final float targetModelPitchOffset = -90.0f;
     private final float targetModelScale = 0.14f;
+    private final List<Vector3> turretPositions = new ArrayList<>();
+    private int currentTurretPositionIndex = 0;
+    private final Random random = new Random();
 
     private ScreenState screenState = ScreenState.MENU;
     private Role localRole = Role.NONE;
@@ -85,6 +89,7 @@ public class App {
     private boolean prevUiLeftMouse = false;
     private float localFireCooldown = 0.0f;
     private float targetAiPhase = 0.0f;
+    private float planeBank = 0.0f;
 
     private final List<BulletTrace> bulletTraces = new ArrayList<>();
 
@@ -165,8 +170,10 @@ public class App {
         map = new Map(1400.0f);
         map.setY(-2.5f);
 
+        initTurretPositions();
+
         planeModel = new ModelLoader();
-        if (!planeModel.loadModel("plane/planedone.fbx", "dragon_scale_texture.jpg")) {
+        if (!planeModel.loadModel("plane/planedone.fbx")) {
             System.err.println("Failed to load plane/planedone.fbx, falling back to simple plane mesh.");
             planeModel = null;
         }
@@ -337,10 +344,17 @@ public class App {
         gameState.planePitch -= mouseDelta.y * sensitivity;
         gameState.planePitch = clamp(gameState.planePitch, -35.0f, 35.0f);
 
+        float targetBank = clamp(mouseDelta.x * 1.25f, -32.0f, 32.0f);
+        float bankLerp = clamp(dt * 8.5f, 0.0f, 1.0f);
+        planeBank += (targetBank - planeBank) * bankLerp;
+        gameState.planeRoll = planeBank;
+
         Vector3 forward = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
         gameState.planePosition.add(forward.mul(gameState.planeSpeed * dt));
 
-        gameState.planePosition.y = clamp(gameState.planePosition.y, 12.0f, 120.0f);
+        float terrainFloor = map != null ? map.getHeightAt(gameState.planePosition.x, gameState.planePosition.z) : 0.0f;
+        float minAltitude = Math.max(-78.0f, terrainFloor);
+        gameState.planePosition.y = clamp(gameState.planePosition.y, minAltitude, 120.0f);
         gameState.planePosition.x = clamp(gameState.planePosition.x, -620.0f, 620.0f);
         gameState.planePosition.z = clamp(gameState.planePosition.z, -620.0f, 620.0f);
 
@@ -383,6 +397,85 @@ public class App {
                 networkPeer.send("FIRE_TURRET");
             }
         }
+    }
+
+    private void initTurretPositions() {
+        turretPositions.clear();
+        turretPositions.add(new Vector3(0.0f, 5.0f, 0.0f));
+        turretPositions.add(new Vector3(220.0f, 5.0f, 180.0f));
+        turretPositions.add(new Vector3(-240.0f, 5.0f, 160.0f));
+        turretPositions.add(new Vector3(260.0f, 5.0f, -220.0f));
+        turretPositions.add(new Vector3(-260.0f, 5.0f, -210.0f));
+        turretPositions.add(new Vector3(40.0f, 5.0f, -320.0f));
+    }
+
+    private void setTurretPositionIndex(int index) {
+        if (turretPositions.isEmpty()) {
+            return;
+        }
+
+        int wrapped = index % turretPositions.size();
+        if (wrapped < 0) {
+            wrapped += turretPositions.size();
+        }
+
+        currentTurretPositionIndex = wrapped;
+        gameState.turretPosition.set(turretPositions.get(currentTurretPositionIndex));
+    }
+
+    private void cycleTurretPosition() {
+        setTurretPositionIndex(currentTurretPositionIndex + 1);
+        if (networkPeer != null && networkPeer.isConnected()) {
+            networkPeer.send("TURRET_POS|" + currentTurretPositionIndex);
+        }
+    }
+
+    private void respawnTargetsAcrossMap() {
+        int targetCount = 6;
+        gameState.targets.clear();
+
+        for (int i = 0; i < targetCount; i++) {
+            Vector3 spawn = new Vector3();
+            boolean placed = false;
+
+            for (int attempt = 0; attempt < 80; attempt++) {
+                float x = -560.0f + random.nextFloat() * 1120.0f;
+                float z = -560.0f + random.nextFloat() * 1120.0f;
+                float terrainHeight = map != null ? map.getHeightAt(x, z) : 0.0f;
+                float heightJitter = random.nextFloat() * 36.0f;
+                if (random.nextFloat() < 0.28f) {
+                    heightJitter += 14.0f + random.nextFloat() * 16.0f;
+                }
+                float y = terrainHeight + 6.0f + heightJitter;
+                y = clamp(y, -6.0f, 72.0f);
+
+                spawn.set(x, y, z);
+                if (spawn.copy().sub(gameState.planePosition).lengthSquared() < 220.0f * 220.0f) {
+                    continue;
+                }
+
+                boolean overlaps = false;
+                for (Vector3 existing : gameState.targets) {
+                    if (existing.copy().sub(spawn).lengthSquared() < 95.0f * 95.0f) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+
+                if (!overlaps) {
+                    placed = true;
+                    break;
+                }
+            }
+
+            if (!placed) {
+                spawn.set(-220.0f + i * 90.0f, 20.0f + (i % 3) * 4.0f, -120.0f + i * 55.0f);
+            }
+
+            gameState.targets.add(spawn.copy());
+        }
+
+        gameState.destroyedTargets = new boolean[gameState.targets.size()];
     }
 
     private void collectTargetsByContact() {
@@ -482,8 +575,12 @@ public class App {
             .append(gameState.planePosition.z).append('|')
             .append(gameState.planeYaw).append('|')
             .append(gameState.planePitch).append('|')
+            .append(gameState.planeRoll).append('|')
             .append(gameState.planeHp).append('|')
-            .append(targetMask());
+            .append(targetMask()).append('|')
+            .append(gameState.turretPosition.x).append('|')
+            .append(gameState.turretPosition.y).append('|')
+            .append(gameState.turretPosition.z);
 
         for (int i = 0; i < gameState.targets.size(); i++) {
             Vector3 target = gameState.targets.get(i);
@@ -559,6 +656,8 @@ public class App {
                     remoteTurretPitch = parseFloatSafe(parts[2], remoteTurretPitch);
                 } else if ("FIRE_TURRET".equals(parts[0])) {
                     remoteTurretFired = true;
+                } else if ("TURRET_POS".equals(parts[0]) && parts.length >= 2) {
+                    setTurretPositionIndex((int) parseFloatSafe(parts[1], currentTurretPositionIndex));
                 }
             } else if (localRole == Role.TURRET) {
                 if ("COUNTDOWN".equals(parts[0]) && parts.length >= 2) {
@@ -567,6 +666,11 @@ public class App {
                 } else if ("START".equals(parts[0])) {
                     screenState = ScreenState.PLAYING;
                 } else if ("SNAP".equals(parts[0]) && parts.length >= 8) {
+                    boolean hasPlaneRoll = parts.length >= 12;
+                    int hpIndex = hasPlaneRoll ? 7 : 6;
+                    int maskIndex = hasPlaneRoll ? 8 : 7;
+                    int turretIndex = hasPlaneRoll ? 9 : 8;
+
                     gameState.planePosition.set(
                         parseFloatSafe(parts[1], gameState.planePosition.x),
                         parseFloatSafe(parts[2], gameState.planePosition.y),
@@ -574,12 +678,26 @@ public class App {
                     );
                     gameState.planeYaw = parseFloatSafe(parts[4], gameState.planeYaw);
                     gameState.planePitch = parseFloatSafe(parts[5], gameState.planePitch);
-                    gameState.planeHp = parseFloatSafe(parts[6], gameState.planeHp);
-                    applyTargetMask((int) parseFloatSafe(parts[7], targetMask()));
+                    if (hasPlaneRoll) {
+                        gameState.planeRoll = parseFloatSafe(parts[6], gameState.planeRoll);
+                    }
+                    gameState.planeHp = parseFloatSafe(parts[hpIndex], gameState.planeHp);
+                    applyTargetMask((int) parseFloatSafe(parts[maskIndex], targetMask()));
 
-                    int expectedPartCount = 8 + gameState.targets.size() * 3;
-                    if (parts.length >= expectedPartCount) {
-                        int partIndex = 8;
+                    int expectedWithTurretPos = turretIndex + 3 + gameState.targets.size() * 3;
+                    int expectedWithoutTurretPos = turretIndex + gameState.targets.size() * 3;
+                    int partIndex = turretIndex;
+
+                    if (parts.length >= expectedWithTurretPos) {
+                        gameState.turretPosition.set(
+                            parseFloatSafe(parts[turretIndex], gameState.turretPosition.x),
+                            parseFloatSafe(parts[turretIndex + 1], gameState.turretPosition.y),
+                            parseFloatSafe(parts[turretIndex + 2], gameState.turretPosition.z)
+                        );
+                        partIndex = turretIndex + 3;
+                    }
+
+                    if (parts.length >= expectedWithoutTurretPos) {
                         for (int i = 0; i < gameState.targets.size(); i++) {
                             Vector3 target = gameState.targets.get(i);
                             target.set(
@@ -732,6 +850,8 @@ public class App {
         glPushMatrix();
         glTranslatef(gameState.planePosition.x, gameState.planePosition.y, gameState.planePosition.z);
         glRotatef(gameState.planeYaw, 0.0f, 1.0f, 0.0f);
+        float renderRoll = (localRole == Role.PILOT) ? planeBank : gameState.planeRoll;
+        glRotatef(renderRoll, 0.0f, 0.0f, 1.0f);
         glRotatef(-gameState.planePitch, 1.0f, 0.0f, 0.0f);
 
         if (planeModel != null && planeModel.isLoaded()) {
@@ -995,6 +1115,11 @@ public class App {
 
         if (screenState == ScreenState.GAME_OVER && key == GLFW_KEY_R) {
             backToMenu();
+            return;
+        }
+
+        if (screenState == ScreenState.PLAYING && localRole == Role.TURRET && key == GLFW_KEY_SPACE) {
+            cycleTurretPosition();
         }
     }
 
@@ -1041,6 +1166,8 @@ public class App {
 
     private void resetRound() {
         gameState.reset();
+        setTurretPositionIndex(0);
+        respawnTargetsAcrossMap();
         remoteTurretYaw = 180.0f;
         remoteTurretPitch = -5.0f;
         localTurretYaw = 180.0f;
@@ -1050,6 +1177,7 @@ public class App {
         prevLeftMouse = false;
         prevUiLeftMouse = false;
         targetAiPhase = 0.0f;
+        planeBank = 0.0f;
         bulletTraces.clear();
     }
 
@@ -1349,6 +1477,7 @@ public class App {
         final Vector3 planePosition = new Vector3();
         float planeYaw;
         float planePitch;
+        float planeRoll;
         float planeSpeed;
         float planeHp;
 
@@ -1360,17 +1489,13 @@ public class App {
             planePosition.set(0.0f, 26.0f, 170.0f);
             planeYaw = 180.0f;
             planePitch = 0.0f;
+            planeRoll = 0.0f;
             planeSpeed = 48.0f;
             planeHp = 3.0f;
 
+            turretPosition.set(0.0f, 5.0f, 0.0f);
             targets.clear();
-            targets.add(new Vector3(-130.0f, 20.0f, -80.0f));
-            targets.add(new Vector3(-40.0f, 25.0f, -130.0f));
-            targets.add(new Vector3(70.0f, 18.0f, -110.0f));
-            targets.add(new Vector3(130.0f, 22.0f, -30.0f));
-            targets.add(new Vector3(60.0f, 16.0f, 90.0f));
-            targets.add(new Vector3(-90.0f, 24.0f, 120.0f));
-            destroyedTargets = new boolean[targets.size()];
+            destroyedTargets = new boolean[0];
         }
 
         int destroyedTargetCount() {

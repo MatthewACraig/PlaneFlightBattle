@@ -18,6 +18,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
@@ -32,8 +33,10 @@ import java.nio.file.Paths;
 import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.lwjgl.glfw.GLFW.*;
@@ -1391,6 +1394,12 @@ public class App {
             return;
         }
 
+        Socket scannedSocket = tryFindHostBySubnetScan(2200, 90);
+        if (scannedSocket != null) {
+            joinGame(scannedSocket);
+            return;
+        }
+
         statusText = "No LAN host discovered. Trying localhost...";
         joinGame("127.0.0.1", NET_PORT);
     }
@@ -1464,6 +1473,83 @@ public class App {
         return addresses;
     }
 
+    private Socket tryFindHostBySubnetScan(int scanTimeoutMs, int connectTimeoutMs) {
+        List<InetAddress> candidates = getSubnetScanCandidates();
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        statusText = "Scanning local subnet for host...";
+        long deadline = System.currentTimeMillis() + Math.max(400, scanTimeoutMs);
+        for (InetAddress candidate : candidates) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                break;
+            }
+
+            int timeout = (int) Math.max(35, Math.min(connectTimeoutMs, remaining));
+            Socket socket = tryConnect(candidate.getHostAddress(), NET_PORT, timeout);
+            if (socket != null) {
+                return socket;
+            }
+        }
+
+        return null;
+    }
+
+    private List<InetAddress> getSubnetScanCandidates() {
+        Set<InetAddress> unique = new LinkedHashSet<>();
+
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                if (!networkInterface.isUp() || networkInterface.isLoopback() || networkInterface.isVirtual()) {
+                    continue;
+                }
+
+                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress address = addresses.nextElement();
+                    if (!(address instanceof Inet4Address) || !address.isSiteLocalAddress()) {
+                        continue;
+                    }
+
+                    byte[] own = address.getAddress();
+                    int ownHost = own[3] & 0xFF;
+                    for (int host = 1; host <= 254; host++) {
+                        if (host == ownHost) {
+                            continue;
+                        }
+
+                        try {
+                            InetAddress candidate = InetAddress.getByAddress(new byte[]{
+                                own[0], own[1], own[2], (byte) host
+                            });
+                            unique.add(candidate);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return new ArrayList<>(unique);
+    }
+
+    private Socket tryConnect(String host, int port, int timeoutMs) {
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(host, port), Math.max(1, timeoutMs));
+            socket.setTcpNoDelay(true);
+            return socket;
+        } catch (IOException ex) {
+            tryClose(socket);
+            return null;
+        }
+    }
+
     private void joinGame(String host, int port) {
         closeNetwork();
         resetRound();
@@ -1474,6 +1560,23 @@ public class App {
             screenState = ScreenState.WAITING;
             statusText = "Connected as Plane 2. Waiting for host countdown...";
         } catch (IOException ex) {
+            statusText = "Join failed: " + ex.getMessage();
+            screenState = ScreenState.MENU;
+            localRole = Role.NONE;
+        }
+    }
+
+    private void joinGame(Socket connectedSocket) {
+        closeNetwork();
+        resetRound();
+
+        try {
+            networkPeer = new ClientPeer(connectedSocket);
+            localRole = Role.TURRET;
+            screenState = ScreenState.WAITING;
+            statusText = "Connected as Plane 2. Waiting for host countdown...";
+        } catch (IOException ex) {
+            tryClose(connectedSocket);
             statusText = "Join failed: " + ex.getMessage();
             screenState = ScreenState.MENU;
             localRole = Role.NONE;
@@ -1877,13 +1980,30 @@ public class App {
             startDiscoveryResponder(port);
 
             Thread acceptThread = new Thread(() -> {
-                while (!closed && clientSocket == null) {
+                while (!closed) {
+                    if (isConnected()) {
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                        }
+                        continue;
+                    }
+
                     try {
                         Socket socket = serverSocket.accept();
+                        socket.setTcpNoDelay(true);
                         clientSocket = socket;
                         writer = new PrintWriter(socket.getOutputStream(), true);
                         incoming.add("SYS_CONNECTED");
-                        startReader(socket, incoming);
+                        startReader(socket, incoming, () -> {
+                            tryClose(socket);
+                            if (clientSocket == socket) {
+                                clientSocket = null;
+                                writer = null;
+                                incoming.add("SYS_DISCONNECTED");
+                            }
+                        });
                     } catch (SocketTimeoutException ignored) {
                     } catch (IOException ex) {
                         if (!closed) {
@@ -2004,7 +2124,11 @@ public class App {
         private final ConcurrentLinkedQueue<String> incoming = new ConcurrentLinkedQueue<>();
 
         ClientPeer(String host, int port) throws IOException {
-            socket = new Socket(host, port);
+            this(new Socket(host, port));
+        }
+
+        ClientPeer(Socket connectedSocket) throws IOException {
+            socket = connectedSocket;
             socket.setTcpNoDelay(true);
             writer = new PrintWriter(socket.getOutputStream(), true);
             startReader(socket, incoming);
@@ -2045,6 +2169,10 @@ public class App {
     }
 
     private static void startReader(Socket socket, ConcurrentLinkedQueue<String> incoming) {
+        startReader(socket, incoming, null);
+    }
+
+    private static void startReader(Socket socket, ConcurrentLinkedQueue<String> incoming, Runnable onClose) {
         Thread readerThread = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
                 String line;
@@ -2052,6 +2180,10 @@ public class App {
                     incoming.add(line);
                 }
             } catch (IOException ignored) {
+            } finally {
+                if (onClose != null) {
+                    onClose.run();
+                }
             }
         }, "net-reader-thread");
         readerThread.setDaemon(true);

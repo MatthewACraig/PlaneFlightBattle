@@ -50,6 +50,9 @@ public class App {
     private static final int DISCOVERY_PORT = 5001;
     private static final String DISCOVERY_QUERY = "PFB_DISCOVER";
     private static final String DISCOVERY_RESPONSE_PREFIX = "PFB_HOST|";
+    private static final int ONLINE_SERVER_PORT = 6000;
+    private static final String ONLINE_SERVER_HOST_ENV = "PFB_SERVER_HOST";
+    private static final String ONLINE_SERVER_PORT_ENV = "PFB_SERVER_PORT";
 
     private enum ScreenState {
         MENU,
@@ -98,7 +101,7 @@ public class App {
     private final ByteBuffer textVertexBuffer = BufferUtils.createByteBuffer(64 * 1024);
     private final GameState gameState = new GameState();
 
-    private String statusText = "Press H to Host (Plane 1) or J to Join (Plane 2)";
+    private String statusText = "H: LAN Host  J: LAN Join  O: Online Host  P: Online Join";
     private String gameOverText = "";
     private float countdownTimer = 3.0f;
     private ScreenState pausedReturnState = ScreenState.PLAYING;
@@ -373,6 +376,7 @@ public class App {
         Vector2 mouseDelta = sampleMouseDelta();
         float sensitivity = 0.1f;
 
+        // Update the pitch, roll and yaw based on the users mouse movement
         gameState.planeYaw -= mouseDelta.x * sensitivity;
         gameState.planePitch -= mouseDelta.y * sensitivity;
         gameState.planePitch = clamp(gameState.planePitch, -35.0f, 35.0f);
@@ -397,10 +401,12 @@ public class App {
             planeBoostEnergy = Math.min(1.0f, planeBoostEnergy + BOOST_REGEN_PER_SECOND * dt);
         }
 
+        // Move the plane forward in the direction it's facing, at a speed based on the current boost state
         Vector3 forward = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
         float speedMultiplier = boosting ? BOOST_MULTIPLIER : 1.0f;
         gameState.planePosition.add(forward.mul(gameState.planeSpeed * speedMultiplier * dt));
 
+        // Terrain collision and clamping to map bounds, so that our lovely plane doesnt fly into the void 
         float terrainFloor = map != null ? map.getHeightAt(gameState.planePosition.x, gameState.planePosition.z) : 0.0f;
         float minAltitude = Math.max(-92.0f, terrainFloor);
         gameState.planePosition.y = clamp(gameState.planePosition.y, minAltitude, 120.0f);
@@ -555,6 +561,7 @@ public class App {
         }
     }
 
+    // Calling this each time that we collect a target, idea is that the targets get harder and harder to capture as the game goes on
     private void updateTargetEvasion(float dt) {
         int totalTargets = gameState.targets.size();
         int destroyedCount = gameState.destroyedTargetCount();
@@ -619,6 +626,7 @@ public class App {
         }
     }
 
+    // Sends the current game state from the pilot to the turret, as this is setup currently as a peer to peer connection wit hte pilot as the authority
     private void sendSnapshotToClient() {
         if (networkPeer == null || !networkPeer.isConnected()) {
             return;
@@ -708,6 +716,24 @@ public class App {
                 continue;
             }
 
+            if ("SYS_CONNECTED".equals(parts[0])) {
+                continue;
+            }
+
+            if ("SYS_DISCONNECTED".equals(parts[0])) {
+                statusText = "Connection lost.";
+                if (screenState == ScreenState.WAITING || screenState == ScreenState.COUNTDOWN || screenState == ScreenState.PLAYING) {
+                    screenState = ScreenState.GAME_OVER;
+                    gameOverText = "Connection lost.";
+                }
+                continue;
+            }
+
+            if ("SYS_ERR".equals(parts[0]) && parts.length >= 2) {
+                statusText = "Network error: " + parts[1];
+                continue;
+            }
+
             if (localRole == Role.PILOT) {
                 if ("P2STATE".equals(parts[0]) && parts.length >= 7) {
                     gameState.plane2Position.set(
@@ -790,6 +816,7 @@ public class App {
         }
     }
 
+    // Renders the 3D scene, including the map, planes, targets, and bullet traces, as well as the 2D overlay with status text and FPS counter
     private void render(int width, int height) {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -815,6 +842,7 @@ public class App {
             return;
         }
 
+        // The camera for the pilot and turret is just behind the plane, and follows thier movement exactly (minus the lerping to the left and right)
         if (localRole == Role.PILOT) {
             Vector3 forward = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
             Vector3 cameraPos = gameState.planePosition.copy().sub(forward.copy().mul(18.0f));
@@ -853,6 +881,8 @@ public class App {
         }
     }
 
+    // Updates the position and gain of the audio sources based on the current game state, 
+    // including the positions of the planes and whether the player is in the pilot or turret role, as well as muting the music if necessary
     private void updateAudioScene() {
         if (audioEngine == null) {
             return;
@@ -1219,9 +1249,11 @@ public class App {
             renderText(20.0f, 70.0f, "PLANE FIGHT BATTLE");
             renderText(20.0f, 95.0f, "H: Host game (you are Plane 1)");
             renderText(20.0f, 115.0f, "J: Join LAN game (auto-find host on Wi-Fi)");
-            renderText(20.0f, 145.0f, "Plane 1: fly through targets");
-            renderText(20.0f, 165.0f, "Plane 2: fly and left-click to shoot Plane 1");
-            renderText(20.0f, 195.0f, statusText);
+            renderText(20.0f, 135.0f, "O: Host online game (Plane 1 via relay server)");
+            renderText(20.0f, 155.0f, "P: Join online game (Plane 2 via relay server)");
+            renderText(20.0f, 185.0f, "Plane 1: fly through targets");
+            renderText(20.0f, 205.0f, "Plane 2: fly and left-click to shoot Plane 1");
+            renderText(20.0f, 235.0f, statusText);
         } else if (screenState == ScreenState.WAITING) {
             renderText(20.0f, 70.0f, "Waiting for other player to join...");
             if (networkPeer != null) {
@@ -1360,6 +1392,10 @@ public class App {
                 hostGame();
             } else if (key == GLFW_KEY_J) {
                 joinLanGame();
+            } else if (key == GLFW_KEY_O) {
+                hostOnlineGame();
+            } else if (key == GLFW_KEY_P) {
+                joinOnlineGame();
             }
             return;
         }
@@ -1385,6 +1421,66 @@ public class App {
             screenState = ScreenState.MENU;
             localRole = Role.NONE;
         }
+    }
+
+    private void hostOnlineGame() {
+        connectOnlineGame(Role.PILOT, "HOST");
+    }
+
+    private void joinOnlineGame() {
+        connectOnlineGame(Role.TURRET, "JOIN");
+    }
+
+    private void connectOnlineGame(Role role, String mode) {
+        closeNetwork();
+        resetRound();
+
+        String host = onlineServerHost();
+        int port = onlineServerPort();
+        try {
+            networkPeer = new RelayPeer(host, port, mode);
+            localRole = role;
+            screenState = ScreenState.WAITING;
+            statusText = "Connected to online server " + host + ":" + port + ". Waiting for match...";
+        } catch (IOException ex) {
+            statusText = "Online connect failed: " + ex.getMessage();
+            screenState = ScreenState.MENU;
+            localRole = Role.NONE;
+        }
+    }
+
+    private String onlineServerHost() {
+        String fromProperty = System.getProperty("pfb.server.host");
+        if (fromProperty != null && !fromProperty.isBlank()) {
+            return fromProperty.trim();
+        }
+
+        String fromEnv = System.getenv(ONLINE_SERVER_HOST_ENV);
+        if (fromEnv != null && !fromEnv.isBlank()) {
+            return fromEnv.trim();
+        }
+
+        return "127.0.0.1";
+    }
+
+    private int onlineServerPort() {
+        String fromProperty = System.getProperty("pfb.server.port");
+        if (fromProperty != null && !fromProperty.isBlank()) {
+            try {
+                return Integer.parseInt(fromProperty.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        String fromEnv = System.getenv(ONLINE_SERVER_PORT_ENV);
+        if (fromEnv != null && !fromEnv.isBlank()) {
+            try {
+                return Integer.parseInt(fromEnv.trim());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        return ONLINE_SERVER_PORT;
     }
 
     private void joinLanGame() {
@@ -1589,7 +1685,7 @@ public class App {
         localRole = Role.NONE;
         screenState = ScreenState.MENU;
         gameOverText = "";
-        statusText = "Press H to Host (Plane 1) or J to Join (Plane 2)";
+        statusText = "H: LAN Host  J: LAN Join  O: Online Host  P: Online Join";
     }
 
     private void resetRound() {
@@ -1726,6 +1822,7 @@ public class App {
         }
     }
 
+    // Logic to get the forward direction vector from yaw and pitch angles (in degrees)
     private Vector3 directionFromYawPitch(float yawDeg, float pitchDeg) {
         float yaw = (float) Math.toRadians(yawDeg);
         float pitch = (float) Math.toRadians(pitchDeg);
@@ -2160,6 +2257,79 @@ public class App {
         @Override
         public String connectionInfo() {
             return "Joined " + socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
+        }
+
+        @Override
+        public void close() {
+            tryClose(socket);
+        }
+    }
+
+    private static final class RelayPeer implements NetworkPeer {
+        private final Socket socket;
+        private final PrintWriter writer;
+        private final ConcurrentLinkedQueue<String> incoming = new ConcurrentLinkedQueue<>();
+        private volatile boolean peerConnected = false;
+
+        RelayPeer(String host, int port, String mode) throws IOException {
+            socket = new Socket();
+            socket.connect(new InetSocketAddress(host, port), 4000);
+            socket.setTcpNoDelay(true);
+            writer = new PrintWriter(socket.getOutputStream(), true);
+
+            writer.println("HELLO|PFB1|" + mode);
+            startReader(socket, incoming, () -> {
+                peerConnected = false;
+                incoming.add("SYS_DISCONNECTED");
+            });
+        }
+
+        @Override
+        public boolean isConnected() {
+            return peerConnected && socket.isConnected() && !socket.isClosed();
+        }
+
+        @Override
+        public void send(String message) {
+            writer.println("MSG|" + message);
+        }
+
+        @Override
+        public List<String> drainMessages() {
+            List<String> out = new ArrayList<>();
+            while (true) {
+                String next = incoming.poll();
+                if (next == null) {
+                    break;
+                }
+
+                if (next.startsWith("SYS|")) {
+                    if (next.startsWith("SYS|PEER_CONNECTED")) {
+                        peerConnected = true;
+                        out.add("SYS_CONNECTED");
+                    } else if (next.startsWith("SYS|PEER_DISCONNECTED")) {
+                        peerConnected = false;
+                        out.add("SYS_DISCONNECTED");
+                    } else if (next.startsWith("SYS|ERR|")) {
+                        String[] parts = next.split("\\|", 3);
+                        out.add(parts.length >= 3 ? "SYS_ERR|" + parts[2] : "SYS_ERR|server_error");
+                    }
+                    continue;
+                }
+
+                if (next.startsWith("MSG|")) {
+                    out.add(next.substring(4));
+                } else {
+                    out.add(next);
+                }
+            }
+            return out;
+        }
+
+        @Override
+        public String connectionInfo() {
+            String state = peerConnected ? "paired" : "waiting";
+            return "Online relay " + socket.getInetAddress().getHostAddress() + ":" + socket.getPort() + " (" + state + ")";
         }
 
         @Override

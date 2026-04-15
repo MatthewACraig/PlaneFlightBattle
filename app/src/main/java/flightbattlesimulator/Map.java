@@ -129,11 +129,14 @@ public class Map {
     }
 
     private boolean buildCollisionGridFromIslandObj() {
+        // 1) Find the OBJ file containing the island mesh.
         Path objPath = resolveIslandObjPath();
         if (objPath == null) {
             return false;
         }
 
+        // 2) Parse only vertex records ("v x y z") from the OBJ.
+        //    We ignore faces/normals/uvs because height sampling only needs positions.
         List<float[]> modelVertices = new ArrayList<>();
         try {
             for (String line : Files.readAllLines(objPath)) {
@@ -160,6 +163,8 @@ public class Map {
             return false;
         }
 
+        // 3) Compute model-space axis-aligned bounds.
+        //    These are used to center and uniformly scale the mesh.
         float minX = Float.MAX_VALUE;
         float maxX = -Float.MAX_VALUE;
         float minY = Float.MAX_VALUE;
@@ -182,15 +187,22 @@ public class Map {
         float width = maxX - minX;
         float height = maxY - minY;
         float depth = maxZ - minZ;
+
+        // 4) Convert model scale -> world scale.
+        //    First normalize so largest model dimension ~= MODEL_TARGET_SIZE,
+        //    then multiply by island world render scale to match what is drawn.
         float maxDim = Math.max(width, Math.max(height, depth));
         float modelScale = maxDim > 0.0001f ? (MODEL_TARGET_SIZE / maxDim) : 1.0f;
         float worldScale = modelScale * ISLAND_WORLD_SCALE;
 
+        // 5) Reset world-space XZ bounds that will define collision grid extents.
         collisionMinX = Float.MAX_VALUE;
         collisionMaxX = -Float.MAX_VALUE;
         collisionMinZ = Float.MAX_VALUE;
         collisionMaxZ = -Float.MAX_VALUE;
 
+        // 6) Transform every vertex into world space, applying center/scale/vertical offset.
+        //    While transforming, capture min/max XZ to size the grid later.
         List<float[]> worldVertices = new ArrayList<>(modelVertices.size());
         for (float[] v : modelVertices) {
             float wx = (v[0] - centerX) * worldScale;
@@ -204,6 +216,8 @@ public class Map {
             collisionMaxZ = Math.max(collisionMaxZ, wz);
         }
 
+        // 7) Allocate the XZ collision grid and initialize all cells as empty.
+        //    +1 ensures both end edges fit in the grid.
         collisionGridWidth = Math.max(2, (int) Math.ceil((collisionMaxX - collisionMinX) / COLLISION_CELL_SIZE) + 1);
         collisionGridHeight = Math.max(2, (int) Math.ceil((collisionMaxZ - collisionMinZ) / COLLISION_CELL_SIZE) + 1);
         collisionHeights = new float[collisionGridWidth * collisionGridHeight];
@@ -211,6 +225,9 @@ public class Map {
             collisionHeights[i] = EMPTY_HEIGHT;
         }
 
+        // 8) Rasterize vertices into grid cells.
+        //    - Main cell gets max height seen (top-most terrain at that XZ cell).
+        //    - Neighbor cells get a slightly lower value to reduce tiny holes/sparsity.
         for (float[] v : worldVertices) {
             int gx = clampInt((int) Math.floor((v[0] - collisionMinX) / COLLISION_CELL_SIZE), 0, collisionGridWidth - 1);
             int gz = clampInt((int) Math.floor((v[2] - collisionMinZ) / COLLISION_CELL_SIZE), 0, collisionGridHeight - 1);
@@ -226,28 +243,38 @@ public class Map {
             }
         }
 
+        // 9) Fill remaining empty pockets from nearby valid samples.
         smoothCollisionGrid(2);
+
+        // 10) Heightfield is now ready for runtime getHeightAt() queries.
         collisionGridReady = true;
         return true;
     }
 
     private void smoothCollisionGrid(int passes) {
+        // No grid data available -> nothing to smooth.
         if (collisionHeights.length == 0) {
             return;
         }
 
+        // Each pass fills only empty cells using valid values from their 3x3 neighborhood.
+        // Existing valid cells remain unchanged to preserve important terrain features.
         for (int pass = 0; pass < passes; pass++) {
             float[] next = collisionHeights.clone();
             for (int z = 0; z < collisionGridHeight; z++) {
                 for (int x = 0; x < collisionGridWidth; x++) {
                     int idx = z * collisionGridWidth + x;
                     float current = collisionHeights[idx];
+
+                    // Keep populated terrain cell as-is.
                     if (current > EMPTY_HEIGHT * 0.5f) {
                         continue;
                     }
 
                     float sum = 0.0f;
                     int count = 0;
+
+                    // Average neighboring valid heights (ignore EMPTY sentinel values).
                     for (int nz = Math.max(0, z - 1); nz <= Math.min(collisionGridHeight - 1, z + 1); nz++) {
                         for (int nx = Math.max(0, x - 1); nx <= Math.min(collisionGridWidth - 1, x + 1); nx++) {
                             float sample = collisionHeights[nz * collisionGridWidth + nx];
@@ -259,11 +286,14 @@ public class Map {
                         }
                     }
 
+                    // Fill this empty cell only if at least one neighbor had terrain data.
                     if (count > 0) {
                         next[idx] = sum / count;
                     }
                 }
             }
+
+            // Commit this pass before running the next one.
             collisionHeights = next;
         }
     }

@@ -53,6 +53,7 @@ public class App {
     private static final int ONLINE_SERVER_PORT = 6000;
     private static final String ONLINE_SERVER_HOST_ENV = "PFB_SERVER_HOST";
     private static final String ONLINE_SERVER_PORT_ENV = "PFB_SERVER_PORT";
+    private static final String MENU_STATUS_TEXT = "H: LAN Host  J: LAN Join  O: Online Host  P: Online Join  C: Shared Screen";
 
     private enum ScreenState {
         MENU,
@@ -101,7 +102,7 @@ public class App {
     private final ByteBuffer textVertexBuffer = BufferUtils.createByteBuffer(64 * 1024);
     private final GameState gameState = new GameState();
 
-    private String statusText = "H: LAN Host  J: LAN Join  O: Online Host  P: Online Join";
+    private String statusText = MENU_STATUS_TEXT;
     private String gameOverText = "";
     private float countdownTimer = 3.0f;
     private ScreenState pausedReturnState = ScreenState.PLAYING;
@@ -114,6 +115,7 @@ public class App {
 
     private boolean prevLeftMouse = false;
     private boolean prevUiLeftMouse = false;
+    private boolean prevTurretShootKey = false;
     private float localFireCooldown = 0.0f;
     private float targetAiPhase = 0.0f;
     private float planeBank = 0.0f;
@@ -123,6 +125,7 @@ public class App {
     private float plane2Bank = 0.0f;
     private float planeBoostEnergy = 1.0f;
     private boolean planeBoostLockedOut = false;
+    private boolean sharedScreenMode = false;
 
     private int currentFps = 0;
     private int fpsFrameCounter = 0;
@@ -356,7 +359,16 @@ public class App {
         }
 
         if (screenState == ScreenState.PLAYING) {
-            if (localRole == Role.PILOT) {
+            if (sharedScreenMode) {
+                updatePilotGameplay(dt);
+                updatePlane2GameplayShared(dt);
+
+                if (gameState.planeHp <= 0.0f) {
+                    endGame("Plane 2 Wins! Plane 1 destroyed.", "PLANE2");
+                } else if (gameState.destroyedTargetCount() == gameState.targets.size()) {
+                    endGame("Plane 1 Wins! All targets destroyed.", "PLANE1");
+                }
+            } else if (localRole == Role.PILOT) {
                 updatePilotGameplay(dt);
 
                 if (gameState.planeHp <= 0.0f) {
@@ -457,11 +469,65 @@ public class App {
 
         if (justPressed && localFireCooldown <= 0.0f) {
             localFireCooldown = 0.15f;
-            Vector3 shotDir = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
-            Vector3 start = gameState.plane2Position.copy().add(shotDir.copy().mul(6.0f));
+            firePlane2Shot(true, false);
+        }
+    }
+
+    private void updatePlane2GameplayShared(float dt) {
+        float yawInput = 0.0f;
+        float pitchInput = 0.0f;
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+            yawInput += 1.0f;
+        }
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+            yawInput -= 1.0f;
+        }
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+            pitchInput += 1.0f;
+        }
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+            pitchInput -= 1.0f;
+        }
+
+        float yawSpeed = 115.0f;
+        float pitchSpeed = 95.0f;
+        gameState.plane2Yaw += yawInput * yawSpeed * dt;
+        gameState.plane2Pitch += pitchInput * pitchSpeed * dt;
+        gameState.plane2Pitch = clamp(gameState.plane2Pitch, -35.0f, 35.0f);
+
+        float targetBank = clamp(-yawInput * 28.0f, -32.0f, 32.0f);
+        float bankLerp = clamp(dt * 8.5f, 0.0f, 1.0f);
+        plane2Bank += (targetBank - plane2Bank) * bankLerp;
+        gameState.plane2Roll = plane2Bank;
+
+        Vector3 forward = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
+        gameState.plane2Position.add(forward.mul(gameState.plane2Speed * dt));
+
+        float terrainFloor = map != null ? map.getHeightAt(gameState.plane2Position.x, gameState.plane2Position.z) : 0.0f;
+        float minAltitude = Math.max(-92.0f, terrainFloor);
+        gameState.plane2Position.y = clamp(gameState.plane2Position.y, minAltitude, 120.0f);
+        gameState.plane2Position.x = clamp(gameState.plane2Position.x, -620.0f, 620.0f);
+        gameState.plane2Position.z = clamp(gameState.plane2Position.z, -620.0f, 620.0f);
+
+        boolean shootHeld = glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS;
+        boolean justPressed = shootHeld && !prevTurretShootKey;
+        prevTurretShootKey = shootHeld;
+        if (justPressed && localFireCooldown <= 0.0f) {
+            localFireCooldown = 0.15f;
+            firePlane2Shot(false, true);
+        }
+    }
+
+    private void firePlane2Shot(boolean sendOverNetwork, boolean applyLocalHit) {
+        Vector3 shotDir = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch).normalize();
+        Vector3 start = gameState.plane2Position.copy().add(shotDir.copy().mul(6.0f));
+
+        if (applyLocalHit) {
+            handlePlane2Shot(start, shotDir);
+        } else {
             addBulletTrace(
                 start,
-                start.copy().add(shotDir.mul(700.0f)),
+                start.copy().add(shotDir.copy().mul(700.0f)),
                 1.0f,
                 0.9f,
                 0.1f
@@ -470,17 +536,18 @@ public class App {
                 audioEngine.setSourcePosition(turretShootSource, gameState.plane2Position);
                 audioEngine.playOneShot(turretShootSource);
             }
-            if (networkPeer != null && networkPeer.isConnected()) {
-                networkPeer.send(
-                    "FIRE_P2|"
-                        + start.x + "|"
-                        + start.y + "|"
-                        + start.z + "|"
-                        + shotDir.x + "|"
-                        + shotDir.y + "|"
-                        + shotDir.z
-                );
-            }
+        }
+
+        if (sendOverNetwork && networkPeer != null && networkPeer.isConnected()) {
+            networkPeer.send(
+                "FIRE_P2|"
+                    + start.x + "|"
+                    + start.y + "|"
+                    + start.z + "|"
+                    + shotDir.x + "|"
+                    + shotDir.y + "|"
+                    + shotDir.z
+            );
         }
     }
 
@@ -820,43 +887,70 @@ public class App {
     private void render(int width, int height) {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        setPerspective(width, height);
-        setupCameraForCurrentState();
-        updateAudioScene();
+        if (shouldRenderSharedScreen()) {
+            renderSharedScreenViews(width, height);
+        } else {
+            setPerspective(width, height);
+            setupCameraForCurrentState(localRole, true);
+            updateAudioScene();
+            renderWorldGeometry();
+        }
 
+        glViewport(0, 0, width, height);
+        renderOverlay(width, height);
+    }
+
+    private boolean shouldRenderSharedScreen() {
+        return sharedScreenMode
+            && (screenState == ScreenState.PLAYING || screenState == ScreenState.COUNTDOWN || screenState == ScreenState.PAUSED);
+    }
+
+    private void renderSharedScreenViews(int width, int height) {
+        int leftWidth = Math.max(1, width / 2);
+        int rightWidth = Math.max(1, width - leftWidth);
+
+        setPerspective(0, 0, leftWidth, height);
+        setupCameraForCurrentState(Role.TURRET, false);
+        renderWorldGeometry();
+
+        setPerspective(leftWidth, 0, rightWidth, height);
+        setupCameraForCurrentState(Role.PILOT, true);
+        updateAudioScene();
+        renderWorldGeometry();
+    }
+
+    private void renderWorldGeometry() {
         map.render();
         renderPlane();
         renderPlane2();
         renderTargets();
         renderBulletTraces();
-
-        renderOverlay(width, height);
     }
 
-    private void setupCameraForCurrentState() {
+    private void setupCameraForCurrentState(Role viewRole, boolean updateListener) {
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
 
         if (screenState == ScreenState.MENU || screenState == ScreenState.WAITING || screenState == ScreenState.GAME_OVER) {
-            setCameraAndListener(0.0f, 55.0f, 145.0f, 0.0f, 15.0f, 0.0f, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(0.0f, 55.0f, 145.0f, 0.0f, 15.0f, 0.0f, 0.0f, 1.0f, 0.0f, updateListener);
             return;
         }
 
         // The camera for the pilot and turret is just behind the plane, and follows thier movement exactly (minus the lerping to the left and right)
-        if (localRole == Role.PILOT) {
+        if (viewRole == Role.PILOT) {
             Vector3 forward = directionFromYawPitch(gameState.planeYaw, gameState.planePitch);
             Vector3 cameraPos = gameState.planePosition.copy().sub(forward.copy().mul(18.0f));
             cameraPos.y += 6.0f;
 
             Vector3 lookTarget = gameState.planePosition.copy().add(forward.copy().mul(15.0f));
-            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f, updateListener);
         } else {
             Vector3 forward = directionFromYawPitch(gameState.plane2Yaw, gameState.plane2Pitch);
             Vector3 cameraPos = gameState.plane2Position.copy().sub(forward.copy().mul(18.0f));
             cameraPos.y += 6.0f;
 
             Vector3 lookTarget = gameState.plane2Position.copy().add(forward.copy().mul(15.0f));
-            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f);
+            setCameraAndListener(cameraPos.x, cameraPos.y, cameraPos.z, lookTarget.x, lookTarget.y, lookTarget.z, 0.0f, 1.0f, 0.0f, updateListener);
         }
     }
 
@@ -869,11 +963,12 @@ public class App {
         float targetZ,
         float upX,
         float upY,
-        float upZ
+        float upZ,
+        boolean updateListener
     ) {
         lookAt(eyeX, eyeY, eyeZ, targetX, targetY, targetZ, upX, upY, upZ);
 
-        if (audioEngine != null) {
+        if (audioEngine != null && updateListener) {
             Vector3 listenerPos = new Vector3(eyeX, eyeY, eyeZ);
             Vector3 listenerForward = new Vector3(targetX - eyeX, targetY - eyeY, targetZ - eyeZ).normalize();
             Vector3 listenerUp = new Vector3(upX, upY, upZ).normalize();
@@ -921,11 +1016,15 @@ public class App {
     }
 
     private void setPerspective(int width, int height) {
-        glViewport(0, 0, width, height);
+        setPerspective(0, 0, width, height);
+    }
+
+    private void setPerspective(int viewportX, int viewportY, int viewportWidth, int viewportHeight) {
+        glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
 
-        float aspect = (float) width / (float) height;
+        float aspect = (float) viewportWidth / (float) viewportHeight;
         float fov = 65.0f;
         float near = 0.1f;
         float far = 3000.0f;
@@ -1251,9 +1350,10 @@ public class App {
             renderText(20.0f, 115.0f, "J: Join LAN game (auto-find host on Wi-Fi)");
             renderText(20.0f, 135.0f, "O: Host online game (Plane 1 via relay server)");
             renderText(20.0f, 155.0f, "P: Join online game (Plane 2 via relay server)");
-            renderText(20.0f, 185.0f, "Plane 1: fly through targets");
-            renderText(20.0f, 205.0f, "Plane 2: fly and left-click to shoot Plane 1");
-            renderText(20.0f, 235.0f, statusText);
+            renderText(20.0f, 175.0f, "C: Shared screen (left Plane 2 turret, right Plane 1 pilot)");
+            renderText(20.0f, 205.0f, "Plane 1: fly through targets");
+            renderText(20.0f, 225.0f, "Plane 2: fly and left-click to shoot Plane 1");
+            renderText(20.0f, 255.0f, statusText);
         } else if (screenState == ScreenState.WAITING) {
             renderText(20.0f, 70.0f, "Waiting for other player to join...");
             if (networkPeer != null) {
@@ -1262,11 +1362,18 @@ public class App {
         } else if (screenState == ScreenState.COUNTDOWN) {
             renderText(20.0f, 70.0f, "Match starts in: " + Math.max(0, (int) Math.ceil(countdownTimer)));
         } else if (screenState == ScreenState.PLAYING) {
-            renderText(20.0f, 70.0f, "Role: " + (localRole == Role.PILOT ? "Plane 1" : "Plane 2"));
+            if (sharedScreenMode) {
+                renderText(20.0f, 70.0f, "Shared Screen: Left=Plane 2 Turret (WASD + E/V)  Right=Plane 1 Pilot (Mouse)");
+            } else {
+                renderText(20.0f, 70.0f, "Role: " + (localRole == Role.PILOT ? "Plane 1" : "Plane 2"));
+            }
             renderText(20.0f, 90.0f, "Plane HP: " + (int) gameState.planeHp);
             renderText(20.0f, 110.0f, "Targets destroyed: " + gameState.destroyedTargetCount() + "/" + gameState.targets.size());
 
-            if (localRole == Role.PILOT) {
+            if (sharedScreenMode) {
+                renderText(20.0f, 130.0f, "Left player: W/S pitch, A/D turn, E or V shoot");
+                renderText(20.0f, 150.0f, "Right player: mouse flies Plane 1 into targets");
+            } else if (localRole == Role.PILOT) {
                 renderText(20.0f, 130.0f, "Mouse to fly Plane 1 into targets");
 
                 renderText(20.0f, 150.0f, "Boost (hold Space):");
@@ -1289,7 +1396,12 @@ public class App {
 
             renderText(20.0f, 190.0f, "Esc: pause + free mouse");
 
-            drawCrosshair(width * 0.5f, height * 0.5f, 10.0f);
+            if (sharedScreenMode) {
+                drawCrosshair(width * 0.25f, height * 0.5f, 10.0f);
+                drawCrosshair(width * 0.75f, height * 0.5f, 10.0f);
+            } else {
+                drawCrosshair(width * 0.5f, height * 0.5f, 10.0f);
+            }
         } else if (screenState == ScreenState.PAUSED) {
             float buttonW = 220.0f;
             float buttonH = 50.0f;
@@ -1396,6 +1508,8 @@ public class App {
                 hostOnlineGame();
             } else if (key == GLFW_KEY_P) {
                 joinOnlineGame();
+            } else if (key == GLFW_KEY_C) {
+                startSharedScreenGame();
             }
             return;
         }
@@ -1410,6 +1524,7 @@ public class App {
     private void hostGame() {
         closeNetwork();
         resetRound();
+        sharedScreenMode = false;
 
         try {
             networkPeer = new HostPeer(NET_PORT);
@@ -1434,6 +1549,7 @@ public class App {
     private void connectOnlineGame(Role role, String mode) {
         closeNetwork();
         resetRound();
+        sharedScreenMode = false;
 
         String host = onlineServerHost();
         int port = onlineServerPort();
@@ -1649,6 +1765,7 @@ public class App {
     private void joinGame(String host, int port) {
         closeNetwork();
         resetRound();
+        sharedScreenMode = false;
 
         try {
             networkPeer = new ClientPeer(host, port);
@@ -1665,6 +1782,7 @@ public class App {
     private void joinGame(Socket connectedSocket) {
         closeNetwork();
         resetRound();
+        sharedScreenMode = false;
 
         try {
             networkPeer = new ClientPeer(connectedSocket);
@@ -1682,10 +1800,20 @@ public class App {
     private void backToMenu() {
         closeNetwork();
         resetRound();
+        sharedScreenMode = false;
         localRole = Role.NONE;
         screenState = ScreenState.MENU;
         gameOverText = "";
-        statusText = "H: LAN Host  J: LAN Join  O: Online Host  P: Online Join";
+        statusText = MENU_STATUS_TEXT;
+    }
+
+    private void startSharedScreenGame() {
+        closeNetwork();
+        resetRound();
+        sharedScreenMode = true;
+        localRole = Role.PILOT;
+        screenState = ScreenState.PLAYING;
+        statusText = "Shared screen active.";
     }
 
     private void resetRound() {
@@ -1697,6 +1825,7 @@ public class App {
         localFireCooldown = 0.0f;
         prevLeftMouse = false;
         prevUiLeftMouse = false;
+        prevTurretShootKey = false;
         targetAiPhase = 0.0f;
         planeBank = 0.0f;
         plane2Bank = 0.0f;
